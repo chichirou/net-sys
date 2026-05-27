@@ -667,7 +667,8 @@ class Collector:
                 core_temps = lhm.get('core_temps', []) or []
                 # GPU メトリクス (LHM が提供する範囲): usage / temp / power / fan / clock
                 # iGPU では nvidia-smi が使えないのでこれが主要ソース
-                live_gpu_usage = lhm.get('gpu_usage')
+                # ★ LHM 側のキー名は 'gpu_load' (使用率), 'gpu_temp' etc
+                live_gpu_usage = lhm.get('gpu_load')
                 live_gpu_extras = {
                     'temp':       lhm.get('gpu_temp'),
                     'power':      lhm.get('gpu_power'),
@@ -1244,25 +1245,43 @@ $res | ConvertTo-Json -Compress
         is_gpu = lambda s: ('/gpu-' in s['id'] or '/gpu/' in s['id']
                              or '/atigpu/' in s['id'] or '/nvidiagpu/' in s['id'])
 
+        # GPU 温度: 'GPU Core' を優先、無ければ 'GPU VR SoC' 等の任意の GPU 温度センサー
         m['gpu_temp'] = find_first(
             lambda s: is_gpu(s) and '/temperature/' in s['id']
             and 'core' in s['text'].lower())
         if m['gpu_temp'] is None:
+            # フォールバック: any GPU temperature (AMD laptops use "GPU VR SoC" etc)
             m['gpu_temp'] = find_first(
                 lambda s: is_gpu(s) and '/temperature/' in s['id'])
 
+        # GPU パワー: 'GPU Core' を優先、無ければ任意 (AMD は "GPU Core" もある)
         m['gpu_power'] = find_first(
-            lambda s: is_gpu(s) and '/power/' in s['id'])
+            lambda s: is_gpu(s) and '/power/' in s['id']
+            and 'core' in s['text'].lower())
+        if m['gpu_power'] is None:
+            m['gpu_power'] = find_first(
+                lambda s: is_gpu(s) and '/power/' in s['id'])
+
         m['gpu_fan'] = find_first(
             lambda s: is_gpu(s) and '/fan/' in s['id'])
+
+        # GPU クロック: 'GPU Core' を優先、無ければ任意
         m['gpu_clock'] = find_first(
             lambda s: is_gpu(s) and '/clock/' in s['id']
             and 'core' in s['text'].lower())
+        if m['gpu_clock'] is None:
+            m['gpu_clock'] = find_first(
+                lambda s: is_gpu(s) and '/clock/' in s['id']
+                and 'memory' not in s['text'].lower())
 
-        # GPU 負荷 (D3D 3D など)
+        # GPU 負荷 (Core 優先、次に 3D、最後に max)
         m['gpu_load'] = find_first(
             lambda s: is_gpu(s) and '/load/' in s['id']
-            and '3d' in s['text'].lower())
+            and s['text'].lower() == 'gpu core')
+        if m['gpu_load'] is None:
+            m['gpu_load'] = find_first(
+                lambda s: is_gpu(s) and '/load/' in s['id']
+                and '3d' in s['text'].lower())
         if m['gpu_load'] is None:
             loads = find_all(lambda s: is_gpu(s) and '/load/' in s['id'])
             m['gpu_load'] = max(loads) if loads else None
@@ -3855,11 +3874,12 @@ class NetSysApp:
             self._health_diag_step()
 
     def _health_diag_step(self):
-        """マーキー描画ループ。毎フレーム自分で次の after をスケジュール。
-        保留中のテキスト変更があれば反映、なければ x 座標だけ進める。
-
-        ちらつき防止のため、テキスト変更時も Canvas を delete せず
-        itemconfig で in-place 更新する。
+        """診断テキストの中央表示ループ。
+        
+        以前は overflow 時にマーキーアニメーションをしていたが、
+        テキストが状態変化で長さが揺れると「流れたり止まったり」して
+        非常に見にくいため、現在は **常に中央固定** + **overflow 時は省略**
+        の静的表示に変更している。
         """
         if not hasattr(self, 'canvas_health_diag'):
             return
@@ -3877,44 +3897,56 @@ class NetSysApp:
         pending_text = getattr(self, '_health_diag_pending_text', None)
         pending_color = getattr(self, '_health_diag_pending_color', MUTED)
         cur_text = getattr(self, '_health_diag_text', None)
+        cur_cw = getattr(self, '_health_diag_cw', None)
 
-        if pending_text is not None and pending_text != cur_text:
-            # テキスト内容が変わった
-            if not pending_text:
-                # 空文字 → text item を消す
-                if self._health_diag_text_id is not None:
-                    cv.delete(self._health_diag_text_id)
-                    self._health_diag_text_id = None
-                self._health_diag_text = ''
-            elif self._health_diag_text_id is None:
-                # 初回 → text item を作成
-                self._health_diag_text_id = cv.create_text(
-                    0, ch // 2, text=pending_text,
-                    fill=pending_color,
-                    font=FONT_MONO_XS, anchor='w')
-                bbox = cv.bbox(self._health_diag_text_id)
-                text_w = (bbox[2] - bbox[0]) if bbox else 0
-                self._health_diag_text_width = text_w
-                # 中央付近から表示開始
-                self._health_diag_x = float((cw - text_w) // 2)
-                cv.coords(self._health_diag_text_id,
-                          int(self._health_diag_x), ch // 2)
-                self._health_diag_text = pending_text
-                self._health_diag_last_t = None
-            else:
-                # 既存 item の text 属性だけ変更 (in-place、ちらつかない)
+        # テキスト or Canvas 幅が変わった場合のみ再描画
+        if (pending_text != cur_text) or (cur_cw != cw):
+            if pending_text is None:
+                pending_text = ''
+            # 古い text item を削除して作り直し (シンプルで確実)
+            if self._health_diag_text_id is not None:
                 try:
-                    cv.itemconfig(self._health_diag_text_id,
-                                  text=pending_text,
-                                  fill=pending_color)
+                    cv.delete(self._health_diag_text_id)
                 except Exception:
                     pass
-                # 幅は変わる可能性があるので再測定
-                bbox = cv.bbox(self._health_diag_text_id)
-                self._health_diag_text_width = (
-                    (bbox[2] - bbox[0]) if bbox else 0)
-                self._health_diag_text = pending_text
-                # x 座標はそのまま継続 (アニメーションを途切れさせない)
+                self._health_diag_text_id = None
+
+            if pending_text:
+                # 一旦テキスト全体で作成して幅測定
+                tmp_id = cv.create_text(
+                    0, ch // 2, text=pending_text,
+                    fill=pending_color, font=FONT_MONO_XS, anchor='w')
+                bbox = cv.bbox(tmp_id)
+                text_w = (bbox[2] - bbox[0]) if bbox else 0
+
+                # Canvas に収まらない場合: 末尾を ... で省略
+                display_text = pending_text
+                if text_w > cw - 4 and cw > 20:
+                    # 1 文字ずつ削ってフィットさせる
+                    while len(display_text) > 4:
+                        display_text = display_text[:-1]
+                        cv.itemconfig(tmp_id, text=display_text + '...')
+                        bbox = cv.bbox(tmp_id)
+                        text_w = (bbox[2] - bbox[0]) if bbox else 0
+                        if text_w <= cw - 4:
+                            display_text = display_text + '...'
+                            break
+                    else:
+                        display_text = display_text + '...'
+
+                # 中央配置
+                center_x = max(2, (cw - text_w) // 2)
+                cv.itemconfig(tmp_id, text=display_text)
+                bbox = cv.bbox(tmp_id)
+                text_w = (bbox[2] - bbox[0]) if bbox else 0
+                center_x = max(2, (cw - text_w) // 2)
+                cv.coords(tmp_id, center_x, ch // 2)
+                self._health_diag_text_id = tmp_id
+                self._health_diag_text_width = text_w
+                self._health_diag_x = float(center_x)
+
+            self._health_diag_text = pending_text
+            self._health_diag_cw = cw
         elif (pending_text == cur_text
                 and self._health_diag_text_id is not None):
             # テキスト同じ、色だけ変わった可能性 → itemconfig で色更新
@@ -3925,33 +3957,10 @@ class NetSysApp:
             except Exception:
                 pass
 
-        # ── アニメーション (x 座標を進める) ──
-        if (self._health_diag_text_id is not None
-                and self._health_diag_text_width > cw):
-            import time
-            now = time.perf_counter()
-            last = getattr(self, '_health_diag_last_t', None)
-            if last is None or now - last > 0.2:
-                # 大きな遅延は捨てる (ジャンプ防止)
-                dt = 0.0
-            else:
-                dt = now - last
-            self._health_diag_last_t = now
-
-            SPEED_PX_PER_SEC = 25.0
-            if not isinstance(self._health_diag_x, float):
-                self._health_diag_x = float(self._health_diag_x)
-            self._health_diag_x -= SPEED_PX_PER_SEC * dt
-
-            text_w = self._health_diag_text_width
-            if self._health_diag_x + text_w < 0:
-                self._health_diag_x = float(cw)
-            cv.coords(self._health_diag_text_id,
-                      int(self._health_diag_x), ch // 2)
-
-        # 次のフレームを必ずスケジュール (永続ループ)
+        # 次のフレームをスケジュール (テキスト/Canvas 幅の変動を検知するため
+        # ループは継続するが、変更が無ければ何も再描画しないので軽い)
         self._health_diag_after_id = self.root.after(
-            16, self._health_diag_step)
+            200, self._health_diag_step)
 
     def _update_gpu_combined(self, e):
         """GPU 統合カードの更新 (CPU LOAD と同様、メインチャート + 多項目サイドペイン)。
@@ -5213,9 +5222,8 @@ class NetSysApp:
         """バッテリー/UPS 情報 (検出されない場合はメッセージ表示)"""
         panel = styled_panel(parent)
         panel.pack(fill='both', expand=True, padx=4, pady=2)
-        # half 幅 (約 200px) に収まる短いサブタイトル
-        section_header(panel, 'BATTERY',
-                       accent_text='[ power ]').pack(fill='x')
+        # half 幅 (約 200px) では accent text を入れると右側が切れるので省略
+        section_header(panel, 'BATTERY').pack(fill='x')
 
         body = tk.Frame(panel, bg=PANEL)
         body.pack(fill='x', padx=8, pady=(2, 8))
@@ -7252,9 +7260,11 @@ class NetSysApp:
         """マザーボード情報（FAN線 + 温度バー統合、電圧ドーナツ）"""
         mobo = e.get('mobo')
         if not mobo:
+            # LHM が SuperIO/EC を一切公開していない (ノート PC や非対応マザボに多い)
             self.chart_fans.set_series([],
                 side_pane=[('FAN', DIM, 9), ('N/A', DIM, 10),
-                            ('no LHM', DIM, 7)], side_width=70)
+                            ('not exposed', DIM, 7)], side_width=70,
+                chart_label='// mainboard sensors not exposed by LHM')
             self._draw_mobo_volt_chart({})
             return
 
