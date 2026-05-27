@@ -1306,32 +1306,41 @@ $res | ConvertTo-Json -Compress
         return m
 
     def _get_mobo_metrics(self):
-        """LHM HTTP からマザーボード (SuperIO チップ) の情報を抽出
-        戻り値: {'voltages': {key: value}, 'temperatures': [...], 'fans': [...]}"""
+        """LHM HTTP からマザーボード (SuperIO チップ等) の情報を抽出
+        戻り値: {'voltages': {key: value}, 'temperatures': [...], 'fans': [...]}
+
+        対象パス:
+          /lpc/<chip>/      — デスクトップの SuperIO (NCT*, IT*, F71*等)
+          /embeddedcontroller/ — ノート PC の EC (Embedded Controller)
+          /battery/         — ノート PC のバッテリ電圧等
+          /mainboard/       — マザーボード総合 (一部の環境)
+        """
         sensors = self._get_lhm_http_sensors()
         if not sensors:
             return None
-        # /lpc/<chip>/ で始まるセンサーが SuperIO（NCT*, IT*, F71*等）
-        mobo = [s for s in sensors if '/lpc/' in s['id']]
+        # マザーボード系として扱うパス (デスクトップ/ノート両対応)
+        mobo_path_keys = ('/lpc/', '/embeddedcontroller/', '/mainboard/')
+        mobo = [s for s in sensors
+                if any(k in s['id'] for k in mobo_path_keys)]
         if not mobo:
             return None
 
         result = {'voltages': {}, 'temperatures': [], 'fans': []}
 
-        # 主要電圧（Text で識別）
+        # 主要電圧 (Text で識別) — デスクトップ用ラベル中心
         for s in mobo:
             if '/voltage/' in s['id']:
                 tl = s['text'].lower()
-                # 標準的な名前のみ拾う（Voltage #2 等の無名は除外）
+                # 標準的な名前のみ拾う (Voltage #2 等の無名は除外)
                 if tl in ('vcore', 'avcc', '+3.3v', '+3v standby',
                            'cmos battery', 'cpu termination',
                            '+5v', '+12v', 'dram', 'vsoc'):
                     result['voltages'][tl] = s['value']
 
-        # 温度（SensorId 順）
+        # 温度 (SensorId 順)
+        # ノート PC の EC では Temperature #0, #1, ... が CPU/GPU/Skin 等
         for s in sorted(mobo, key=lambda x: x['id']):
             if '/temperature/' in s['id']:
-                # ID 末尾の番号を抽出
                 try:
                     tnum = int(s['id'].split('/')[-1])
                 except ValueError:
@@ -1344,6 +1353,7 @@ $res | ConvertTo-Json -Compress
                 })
 
         # FAN (RPM) + Control
+        # ノート PC の EC では /fan/ ではなく /control/ にしか出ない場合もある
         rpms, ctrls = {}, {}
         for s in mobo:
             if '/fan/' in s['id']:
@@ -1356,13 +1366,14 @@ $res | ConvertTo-Json -Compress
                     idx = int(s['id'].split('/')[-1])
                     ctrls[idx] = s['value']
                 except ValueError: pass
-        for idx in sorted(rpms.keys()):
+        for idx in sorted(set(list(rpms.keys()) + list(ctrls.keys()))):
             result['fans'].append({
                 'idx': idx,
-                'rpm': rpms[idx],
+                'rpm':     rpms.get(idx),
                 'control': ctrls.get(idx),
             })
         return result
+
 
     def _get_ohm_sensor(self, sensor_type, hardware_prefix):
         """OpenHardwareMonitor / LibreHardwareMonitor から値を取得
@@ -1509,8 +1520,10 @@ $res | ConvertTo-Json -Compress
             # ── マザーボード (SuperIO) データ ──
             mobo = self._get_mobo_metrics()
             if mobo:
-                # FAN 履歴
+                # FAN 履歴 (rpm が None の場合は skip)
                 for fan in mobo['fans']:
+                    if fan.get('rpm') is None:
+                        continue
                     idx = fan['idx']
                     if idx not in self.fan_history:
                         self.fan_history[idx] = deque(maxlen=HISTORY_LEN)
@@ -3747,8 +3760,16 @@ class NetSysApp:
                                       sublabel=metric['sub'])
 
         # ステータス表示 (総合スコアに基づく)
+        # 値が変わったときだけ config 呼び出し (毎秒呼ぶとちらつきの原因に)
         if hasattr(self, 'lbl_health_status'):
-            self.lbl_health_status.config(text=status, fg=status_color)
+            try:
+                cur_text = self.lbl_health_status.cget('text')
+                cur_fg   = str(self.lbl_health_status.cget('fg'))
+            except Exception:
+                cur_text = None
+                cur_fg = None
+            if cur_text != status or cur_fg != status_color:
+                self.lbl_health_status.config(text=status, fg=status_color)
 
         # AI 風診断コメント (Canvas でピクセル単位の滑らかなマーキー表示)
         if hasattr(self, 'canvas_health_diag'):
@@ -4004,11 +4025,21 @@ class NetSysApp:
 
         # ── メインチャート: usage 実線 (シアン) + pwr 破線 (黄) の 2 本構成 ──
         # 色は両方ともサイドペインのラベル色と一致させてある (視覚的対応)
+        # メインチャート: usage (ACCENT 実線+塗り) + power (YELLOW 破線)
+        # ただし、iGPU 等で usage が N/A の場合は、clock または temp を主シリーズとして描く
+        # (グラフが空っぽにならないようフォールバック)
         # チャート内に文字 (chart_label) は出さない
-        gpu_pwr_hist = e.get('gpu_power_history') or []
-        if usage_hist:
-            # pwr のスケール: 履歴の max を見て auto-scale (低消費の iGPU でも線が見えるように)
-            #                 最低 5W、データの 1.5 倍を確保
+        gpu_pwr_hist  = e.get('gpu_power_history') or []
+        gpu_clk_hist  = e.get('gpu_clock_history') or []
+        gpu_temp_hist = e.get('gpu_temp_history') or []
+
+        # usage が取れているか
+        usage_filtered = [u for u in (usage_hist or [])
+                           if u is not None and u > 0]
+        has_usage = bool(usage_filtered)
+
+        if has_usage:
+            # 通常モード: usage を主シリーズ + power を破線
             pwr_filtered = [p for p in gpu_pwr_hist if p is not None]
             if pwr_filtered and max(pwr_filtered) > 0:
                 pwr_max = max(5, max(pwr_filtered) * 1.5)
@@ -4021,8 +4052,51 @@ class NetSysApp:
                 extra_series=extra,
                 side_pane=side, side_width=90,
                 side_pane_compact=True)
+        elif gpu_clk_hist:
+            # フォールバック A: clock 履歴を主シリーズに (% 換算で描画)
+            # iGPU で usage が出ない場合でも、クロック変動でアクティビティが見える
+            clk_filtered = [c for c in gpu_clk_hist if c is not None and c > 0]
+            if clk_filtered:
+                clk_max = max(clk_filtered) * 1.2  # 上 20% 余裕
+                # ChartFrame は 0-100 % スケールなので、clock を百分率にスケール
+                clk_scaled = [(c / clk_max * 100) if c is not None else 0
+                              for c in gpu_clk_hist]
+                # temp が取れていれば extra series で破線追加
+                temp_filtered = [t for t in gpu_temp_hist if t is not None]
+                if temp_filtered:
+                    extra = [(gpu_temp_hist, YELLOW, max(85, max(temp_filtered) * 1.2))]
+                else:
+                    extra = None
+                self.chart_gpu_combined.set_series(
+                    [(clk_scaled, ACCENT, '#0d3d52')],
+                    max_pct=100,
+                    extra_series=extra,
+                    side_pane=side, side_width=90,
+                    side_pane_compact=True)
+            else:
+                self.chart_gpu_combined.set_series(
+                    [],
+                    side_pane=side, side_width=90,
+                    side_pane_compact=True)
+        elif gpu_temp_hist:
+            # フォールバック B: temp だけ取れる
+            temp_filtered = [t for t in gpu_temp_hist if t is not None]
+            if temp_filtered:
+                tmax = max(85, max(temp_filtered) * 1.2)
+                temp_scaled = [(t / tmax * 100) if t is not None else 0
+                               for t in gpu_temp_hist]
+                self.chart_gpu_combined.set_series(
+                    [(temp_scaled, YELLOW, None)],
+                    max_pct=100,
+                    side_pane=side, side_width=90,
+                    side_pane_compact=True)
+            else:
+                self.chart_gpu_combined.set_series(
+                    [],
+                    side_pane=side, side_width=90,
+                    side_pane_compact=True)
         else:
-            # 履歴が空 (起動直後など)
+            # 履歴が完全に空 (起動直後など)
             self.chart_gpu_combined.set_series(
                 [],
                 side_pane=side, side_width=90,
@@ -5139,8 +5213,9 @@ class NetSysApp:
         """バッテリー/UPS 情報 (検出されない場合はメッセージ表示)"""
         panel = styled_panel(parent)
         panel.pack(fill='both', expand=True, padx=4, pady=2)
+        # half 幅 (約 200px) に収まる短いサブタイトル
         section_header(panel, 'BATTERY',
-                       accent_text='[ power source ]').pack(fill='x')
+                       accent_text='[ power ]').pack(fill='x')
 
         body = tk.Frame(panel, bg=PANEL)
         body.pack(fill='x', padx=8, pady=(2, 8))
@@ -7185,7 +7260,8 @@ class NetSysApp:
 
         # ── FAN 折れ線（実線、最大5本）──
         fan_history = e.get('fan_history', {})
-        active_fans = [f for f in mobo['fans'] if f['rpm'] > 0]
+        active_fans = [f for f in mobo['fans']
+                       if f.get('rpm') is not None and f['rpm'] > 0]
         active_fans.sort(key=lambda f: f['rpm'], reverse=True)
         fan_colors = [YELLOW, '#ff66b3', ACCENT, ORANGE, GREEN]
         series = []
