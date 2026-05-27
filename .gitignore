@@ -1,0 +1,70 @@
+# ====== Python ======
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+*.egg
+build/
+dist/
+*.spec
+
+# Distribution / packaging
+develop-eggs/
+downloads/
+eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# ====== IDE / Editor ======
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ====== Windows ======
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# ====== net-sys specific ======
+# ユーザー設定 (各環境固有なので公開しない)
+~/.net_sys_config.json
+.net_sys_config.json
+
+# 履歴 DB (実行時に生成される、サイズが大きい)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+net_sys_history.db
+
+# ローカルテスト用ファイル
+test_*.py
+shot_*.png
+/tmp/test_*
+
+# 開発用 / 一時ファイル
+HANDOFF.md
+*.log
+*.tmp
+
+# LibreHardwareMonitor バイナリ等 (各自インストール)
+LibreHardwareMonitor*/
+*.exe

@@ -1,0 +1,2 @@
+# Core dependency (auto-installed on first run if missing)
+psutil>=5.9.0
