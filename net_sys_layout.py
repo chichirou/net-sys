@@ -188,29 +188,28 @@ class DashboardLayoutManager:
                         break
                 migrated.insert(insert_idx, {'cards': [sid]})
 
-            # 後処理: half-span カードが単独行になっている場合、
-            # 他の half-span 単独行と結合する。
-            # mem の場合は HEALTH を優先的にペアリング、見つからなければ
-            # 他の half 単独行と結合する。
-            def _is_half_single(row):
+            # 後処理: half / third の「単独行」 を、 同じ span の他の単独行と
+            # 結合して横並びにする。 これにより、 新しく追加された third カード
+            # (POWER 等) が単独行で挿入されても、 BATTERY と自動でペアになり
+            # 横3分割で並ぶ。 mem の場合は HEALTH を優先的にペアにする。
+            def _pair_span(row):
                 cards = row['cards']
                 if len(cards) != 1:
-                    return False
-                spec = self.section_specs.get(cards[0], {})
-                return spec.get('default_span') == 'half'
+                    return None
+                sp = self.section_specs.get(cards[0], {}).get('default_span')
+                return sp if sp in ('half', 'third') else None
 
             combined = []
             used_indices = set()
             for i, row in enumerate(migrated):
                 if i in used_indices:
                     continue
-                if not _is_half_single(row):
+                sp = _pair_span(row)
+                if sp is None:
                     combined.append(row)
                     continue
                 sid = row['cards'][0]
-                # この half 単独行とペアになる相手を探す:
-                # 1. mem なら health を優先
-                # 2. それ以外は最初の未使用 half 単独行
+                # ペア相手を探す: 1. mem↔health を優先 2. 同じ span の単独行
                 preferred_partner = None
                 if sid == 'mem':
                     preferred_partner = 'health'
@@ -226,11 +225,11 @@ class DashboardLayoutManager:
                             partner_idx = j
                             break
                 if partner_idx is None:
-                    # 任意の half 単独行をペアに
+                    # 同じ span (half↔half / third↔third) の単独行をペアに
                     for j in range(i + 1, len(migrated)):
                         if j in used_indices:
                             continue
-                        if _is_half_single(migrated[j]):
+                        if _pair_span(migrated[j]) == sp:
                             partner_idx = j
                             break
 
@@ -252,6 +251,9 @@ class DashboardLayoutManager:
             cards = row.get('cards', [])
             if set(cards) == {'mem', 'health'} and len(cards) == 2:
                 row['cards'] = ['mem', 'health']
+            # BATTERY/POWER ペアは BATTERY を左に固定
+            if set(cards) == {'battery', 'power_cost'} and len(cards) == 2:
+                row['cards'] = ['battery', 'power_cost']
 
         # スキーマバージョンを最新として保存 (一回限りの整理を再実行させない)
         if self.config_set:
@@ -314,6 +316,14 @@ class DashboardLayoutManager:
         for f in self.card_frames.values():
             try: f.grid_forget()
             except Exception: pass
+
+        # 古い half-pair サブフレームを破棄 (rebuild 対応)
+        # half ペア (MEM/HEALTH 以外) は専用サブフレームで隔離配置するため、
+        # 再描画のたびに作り直す。
+        for sf in getattr(self, '_pair_subframes', []):
+            try: sf.destroy()
+            except Exception: pass
+        self._pair_subframes = []
 
         # 6 列 grid を設定
         # 注: uniform='dash' だと、半幅 (span=3+3) のときは 50/50 になるが、
@@ -393,6 +403,58 @@ class DashboardLayoutManager:
                               padx=2, pady=2)
                     self._setup_card_bindings(sid)
                     self._update_card_visual(sid)
+            elif n == 2 and set(cards) != {'mem', 'health'}:
+                # MEM/HEALTH 以外の 2 カードペア。
+                # 各カードの default_span から列幅を決める。
+                spans = [self.SPAN_MAP.get(
+                             self.section_specs.get(sid, {}).get(
+                                 'default_span', 'half'), 3)
+                         for sid in cards]
+                if all(s <= 2 for s in spans):
+                    # third (2 列ずつ) のペア:
+                    # 親 grid の 6 列は MEM/HEALTH 用に不均等なので、専用サブフレームに
+                    # 隔離して厳密に 3 等分する (440px 幅なら各 ~146px)。
+                    # 2 カードを左の 2 枠に置き、3 枠目は空白として残す。
+                    # → "2+2+2 の 3 分割で 3 枚目は空白" の構成。
+                    sub = tk.Frame(self.container, bg=self.theme['BG'])
+                    sub.grid(row=row_idx, column=0, columnspan=6,
+                             sticky='nsew', padx=0, pady=0)
+                    sub.grid_rowconfigure(0, weight=1)
+                    for c in range(3):
+                        sub.grid_columnconfigure(c, weight=1, uniform='thirdpair')
+                    self._pair_subframes.append(sub)
+                    for idx, sid in enumerate(cards):
+                        card = self.card_frames.get(sid)
+                        if not card: continue
+                        card.grid(in_=sub, row=0, column=idx,
+                                  sticky='nsew', padx=2, pady=2)
+                        try: card.lift()
+                        except Exception: pass
+                        self._setup_card_bindings(sid)
+                        self._update_card_visual(sid)
+                    # 3 枠目 (column=2) は空白のまま残す
+                else:
+                    # half (3 列) ペア (BATTERY/POWER 等):
+                    # 親 grid の列幅は MEM/HEALTH 用に非対称 (列 4,5 が minsize=95)
+                    # なので、専用サブフレームに隔離して厳密に 50:50 へ分割する。
+                    sub = tk.Frame(self.container, bg=self.theme['BG'])
+                    sub.grid(row=row_idx, column=0, columnspan=6,
+                             sticky='nsew', padx=0, pady=0)
+                    sub.grid_rowconfigure(0, weight=1)
+                    sub.grid_columnconfigure(0, weight=1, uniform='halfpair')
+                    sub.grid_columnconfigure(1, weight=1, uniform='halfpair')
+                    self._pair_subframes.append(sub)
+                    for idx, sid in enumerate(cards):
+                        card = self.card_frames.get(sid)
+                        if not card: continue
+                        card.grid(in_=sub, row=0, column=idx,
+                                  sticky='nsew', padx=2, pady=2)
+                        # in_ で別フレームに配置すると、後から作られた sub の背面に
+                        # カードが隠れてしまうため、明示的に前面へ持ち上げる
+                        try: card.lift()
+                        except Exception: pass
+                        self._setup_card_bindings(sid)
+                        self._update_card_visual(sid)
             elif n in (2, 3, 6):
                 # 等分配置 (基本)
                 # 例外: mem + health は MEM 側にコンテンツが多い (3 ドーナツ + 文字)

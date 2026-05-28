@@ -36,6 +36,7 @@ import os
 import json
 import time
 import socket
+import random
 import ctypes
 import platform
 import threading
@@ -66,6 +67,14 @@ if platform.system() == 'Windows':
 
 import tkinter as tk
 from tkinter import ttk, messagebox
+
+# Matrix モードの「文字の中のレイン」 用 (任意依存)。 無ければ近似描画。
+try:
+    from PIL import Image as _PILImage, ImageDraw as _PILDraw
+    from PIL import ImageFont as _PILFont, ImageTk as _PILTk
+    _MATRIX_PIL = True
+except Exception:
+    _MATRIX_PIL = False
 
 # 履歴機能（SQLite ベース、net_sys_history.py に分離）
 # 同ディレクトリに net_sys_history.py が無い場合は機能を無効化
@@ -831,6 +840,7 @@ class Collector:
             core_temps = []
             live_gpu_usage = None
             live_gpu_extras = None
+            live_cpu_power = None
             skip_lhm = self._live_initial
             if self._live_initial:
                 self._live_initial = False
@@ -839,6 +849,8 @@ class Collector:
                 core_voltages = lhm.get('core_voltages', []) or []
                 core_clocks = lhm.get('core_clocks', []) or []
                 core_temps = lhm.get('core_temps', []) or []
+                # CPU Package 電力 (W) — 電気代計算に使う
+                live_cpu_power = lhm.get('cpu_power')
                 # GPU メトリクス (LHM が提供する範囲): usage / temp / power / fan / clock
                 # iGPU では nvidia-smi が使えないのでこれが主要ソース
                 # ★ LHM 側のキー名は 'gpu_load' (使用率), 'gpu_temp' etc
@@ -937,6 +949,8 @@ class Collector:
                 'gpu_power_history': list(self.gpu_power_history),
                 'gpu_fan_history': list(self.gpu_fan_history),
                 'gpu_clock_history': list(self.gpu_clock_history),
+                # CPU Package 電力 (W) — 電気代計算用 (GPU は gpu_extras.power)
+                'cpu_power': live_cpu_power,
             }
 
     def static(self):
@@ -1503,10 +1517,11 @@ $res | ConvertTo-Json -Compress
             and 'core #' in s['text'].lower())
         m['cpu_clock'] = max(clocks) if clocks else None
 
-        # CPU 電力 (Package)
+        # CPU 電力 (Package)。 Intel は "CPU Package"、 AMD は "Package" のことが
+        # 多いので、 "package" を含む電力センサーを広く拾う。
         m['cpu_power'] = find_first(
             lambda s: ('/intelcpu/' in s['id'] or '/amdcpu/' in s['id'])
-            and '/power/' in s['id'] and 'cpu package' in s['text'].lower())
+            and '/power/' in s['id'] and 'package' in s['text'].lower())
 
         # 各コアの電圧/クロック/温度 (CPU Core #1〜)
         # LHM のテキスト名はベンダ・モデルによって異なる:
@@ -2931,19 +2946,23 @@ def styled_panel(parent, **kwargs):
                     highlightbackground=BORDER, **kwargs)
 
 
-def section_header(parent, label, accent_text="", **kwargs):
+def section_header(parent, label, accent_text="", title_font=None, **kwargs):
     """セクションヘッダー（NET::XXX 風）。frame.title_label でメインラベルにアクセス可
 
     title (FONT_HEAD, 太字大) と sub_label (FONT_MONO_S, 細字小) の baseline を
     揃える: sub_label に pady=(N, 0) を入れて、title の baseline 付近に下端を合わせる。
+
+    title_font: 指定すると "::" とラベルのフォントを差し替える (狭い third 幅の
+                カードでヘッダーが見切れるのを防ぐ用途)。 未指定なら FONT_HEAD。
     """
+    tf = title_font or FONT_HEAD
     frame = tk.Frame(parent, bg=PANEL, **kwargs)
     inner = tk.Frame(frame, bg=PANEL)
     inner.pack(side='left', padx=12, pady=(2, 0))
     tk.Label(inner, text="::", bg=PANEL, fg=ACCENT,
-             font=FONT_HEAD).pack(side='left')
+             font=tf).pack(side='left')
     title_label = tk.Label(inner, text=label, bg=PANEL, fg=TEXT_BRIGHT,
-             font=FONT_HEAD)
+             font=tf)
     title_label.pack(side='left', padx=(0, 8))
     sub_label = None
     if accent_text:
@@ -4055,6 +4074,26 @@ class NetSysApp:
         self._last_dimm_data = None
         self._lhm_status = (False, None)  # (running, name)
 
+        # ── 電気代計算の状態 ──
+        # CPU+GPU の消費電力 (LHM) を積算してセッション中の電気代を見積もる
+        self._power_accum_wh = 0.0       # 起動からの積算電力量 (Wh)
+        self._power_elapsed_s = 0.0      # 積算した経過秒 (平均電力の計算用)
+        self._power_last_t = time.time() # 前回サンプルの時刻
+        # 電気代単価 (円/kWh)。 日本の家庭用電力の目安は 31 円前後。 設定で変更可。
+        self._power_rate_yen = self.config.get('power_rate_yen', 31)
+
+        # ── Matrix モード (隠しコマンド) の状態 ──
+        # "matrix" とタイプすると背景に緑の落下文字。 もう一度入力 or ESC で解除。
+        self._matrix_on = False
+        self._matrix_buffer = ''      # キー入力の蓄積 (末尾が matrix で発動)
+        self._matrix_after = None     # アニメーションの after id
+        self._matrix_canvas = None    # オーバーレイ Canvas
+        self._matrix_drops = []       # 各列の落下位置
+        # intro で表示するテキスト (設定で変更可)。 最初の空白で2段に分けて
+        # 「前半 → 間 → 後半」 とタイプする。
+        self._matrix_intro_text = self.config.get(
+            'matrix_intro_text', 'Hello chichirou')
+
         # ── 履歴 DB の初期化（_build_ui より前に実行する必要あり） ──
         # _build_ui → _build_history / _build_settings の中で self.history_db を参照する
         self.history_db = None
@@ -4091,6 +4130,9 @@ class NetSysApp:
 
         self._setup_root()
         _ts("after _setup_root")
+        # 起動した瞬間にロゴを表示 (update で即描画)。 この後の _build_ui は
+        # ロゴ表示中に実行される。
+        self._show_splash()
         self._build_ui()
         _ts("after _build_ui")
         # 透明度適用
@@ -4113,6 +4155,116 @@ class NetSysApp:
         self.root.after(50,
             lambda: threading.Thread(target=self._background_init,
                                        daemon=True).start())
+
+    _ASCII_LOGO = (
+        ' _   _ _____ _____   ______   ______\n'
+        '| \\ | | ____|_   _| / ___\\ \\ / / ___|\n'
+        '|  \\| |  _|   | |   \\___ \\\\ V /\\___ \\\n'
+        '| |\\  | |___  | |    ___) || |  ___) |\n'
+        '|_| \\_|_____| |_|   |____/ |_| |____/'
+    )
+
+    def _get_work_area(self):
+        """Windows の作業領域 (タスクバーを除いた表示可能範囲) を
+        (left, top, right, bottom) で返す。 取れなければ None。"""
+        try:
+            import ctypes
+            from ctypes import wintypes
+            SPI_GETWORKAREA = 0x0030
+            rect = wintypes.RECT()
+            ok = ctypes.windll.user32.SystemParametersInfoW(
+                SPI_GETWORKAREA, 0, ctypes.byref(rect), 0)
+            if ok:
+                return rect.left, rect.top, rect.right, rect.bottom
+        except Exception:
+            pass
+        return None
+
+    def _splash_center(self):
+        """config の geometry から、 メインが実際に表示される矩形を推定し、
+        その中央を (x, y) で返す (ロゴ左上座標)。 画面外実体化は使わない。"""
+        import re
+        try:
+            self.root.update_idletasks()  # geometry を確定させてから読む
+        except Exception:
+            pass
+        m = re.match(r'(\d+)x(\d+)\+(-?\d+)\+(-?\d+)', self.root.geometry())
+        if m:
+            cw, ch, cx, cy = map(int, m.groups())
+        else:
+            cw, ch, cx, cy = FIXED_WIDTH, 1080, 100, 50
+        eff_h = ch
+        eff_y = cy
+        wa = self._get_work_area()
+        if wa:
+            wl, wt, wr, wb = wa
+            # ウィンドウは作業領域に収まるよう OS が高さ・位置を調整する
+            eff_h = min(ch, wb - wt)
+            if eff_y + eff_h > wb:
+                eff_y = wb - eff_h          # 下にはみ出たら上に押し上げ
+            if eff_y < wt:
+                eff_y = wt                   # 上にはみ出たら下げる
+        W, H = getattr(self, '_splash_size', (410, 180))
+        x = cx + (cw - W) // 2
+        y = eff_y + (eff_h - H) // 2
+        return x, y
+
+    def _show_splash(self):
+        """起動直後にロゴだけを即表示する (メインは隠れたまま)。 位置は config の
+        geometry と画面の作業領域から計算 (画面外実体化なし)。 update() で即描画。"""
+        try:
+            W, H = 410, 180
+            self._splash_size = (W, H)
+            x, y = self._splash_center()
+            sp = tk.Toplevel(self.root)
+            sp.overrideredirect(True)
+            sp.configure(bg='#000000', highlightthickness=1,
+                         highlightbackground='#ffffff')
+            sp.geometry(f'{W}x{H}+{x}+{y}')
+            try:
+                sp.attributes('-topmost', True)
+            except Exception:
+                pass
+            tk.Label(sp, text=self._ASCII_LOGO, bg='#000000', fg='#ffffff',
+                     font=('Courier New', 11, 'bold'),
+                     justify='left').pack(expand=True, pady=(20, 2))
+            tk.Label(sp, text=':: SYSTEM MONITOR ::', bg='#000000',
+                     fg='#ffffff', font=('Courier New', 10, 'bold')).pack(
+                pady=(0, 16))
+            self._splash = sp
+            sp.update()  # mainloop 前でも即描画 (起動した瞬間に出す)
+            self.root.after(2000, lambda: self._splash_fadeout(sp, 1.0))
+        except Exception:
+            try:
+                self.root.deiconify()
+            except Exception:
+                pass
+
+    def _splash_fadeout(self, sp, alpha):
+        """スプラッシュをゆっくり透明化し、 消えたらメインウィンドウを表示。"""
+        alpha -= 0.035
+        if alpha <= 0:
+            try:
+                sp.destroy()
+            except Exception:
+                pass
+            try:
+                self.root.deiconify()
+            except Exception:
+                pass
+            return
+        try:
+            sp.attributes('-alpha', alpha)
+            sp.after(50, lambda: self._splash_fadeout(sp, alpha))
+        except Exception:
+            try:
+                sp.destroy()
+            except Exception:
+                pass
+            try:
+                self.root.deiconify()
+            except Exception:
+                pass
 
     def _apply_theme_from_config(self):
         """設定からテーマ名を読み、グローバル変数を更新"""
@@ -4214,8 +4366,16 @@ class NetSysApp:
         self.root.minsize(FIXED_WIDTH, 700)
         self.root.maxsize(FIXED_WIDTH, 99999)  # ★ 最大化ボタンも幅は変えられなくなる
 
+        # スプラッシュ表示中はメインを隠す (フェードアウト完了時に表示)
+        try:
+            self.root.withdraw()
+        except Exception:
+            pass
+
         # 4. 念の為 <Configure> イベントで幅が変わったら戻す (最後の防壁)
         self.root.bind('<Configure>', self._enforce_fixed_width)
+        # 隠しコマンド: "matrix" とタイプで Matrix モード切替
+        self.root.bind('<Key>', self._on_key_matrix, add='+')
 
         # ttk スタイル
         style = ttk.Style()
@@ -4298,6 +4458,473 @@ class NetSysApp:
         except Exception:
             pass
 
+    # ──────────────────────────────────────────────
+    # Matrix モード (隠しコマンド) — 背景に緑の落下文字
+    # ──────────────────────────────────────────────
+    def _on_key_matrix(self, event):
+        """キー入力を監視し、"matrix" と打たれたら Matrix モードを切り替える。
+        Matrix 表示中は ESC でも解除できる。"""
+        # 表示中の ESC で即解除
+        if self._matrix_on and event.keysym == 'Escape':
+            self._toggle_matrix()
+            return
+        ch = (event.char or '').lower()
+        if ch and ch.isalpha():
+            # 末尾 6 文字を保持して "matrix" 判定
+            self._matrix_buffer = (self._matrix_buffer + ch)[-6:]
+            if self._matrix_buffer == 'matrix':
+                self._matrix_buffer = ''
+                self._toggle_matrix()
+
+    def _toggle_matrix(self):
+        if self._matrix_on:
+            self._matrix_off()
+        else:
+            self._matrix_start()
+
+    def _matrix_start(self):
+        """オーバーレイ Canvas を全面に置いてアニメーション開始"""
+        self._matrix_on = True
+        self._matrix_canvas = tk.Canvas(self.root, bg='#000000',
+                                         highlightthickness=0, bd=0)
+        self._matrix_canvas.place(x=0, y=0, relwidth=1, relheight=1)
+        self._matrix_canvas.bind('<Button-1>', lambda e: self._matrix_off())
+        self.root.update_idletasks()
+        w = max(self.root.winfo_width(), 100)
+        h = max(self.root.winfo_height(), 100)
+        self._matrix_cell = 13
+        cols = max(1, w // self._matrix_cell)
+        rows = h // self._matrix_cell + 2
+        self._matrix_rows = rows
+        chars = self._MATRIX_CHARS
+        # 各列の状態: head(先頭の行位置, float), speed(落下速度), trail(尾の長さ)
+        self._matrix_cols_data = []
+        for _ in range(cols):
+            self._matrix_cols_data.append({
+                'head': random.uniform(-rows, 0),
+                'speed': random.uniform(0.35, 1.1),     # 列ごとに速度差
+                'trail': random.randint(10, min(rows, 30)),  # 尾の長さ
+            })
+        # 各セル (列×行) の文字を保持し、 時々だけ差し替える (チラつき表現)
+        self._matrix_grid = [[random.choice(chars) for _ in range(rows)]
+                             for _ in range(cols)]
+        # ── シーケンス管理 ──
+        # intro(Hello chichirou をタイプ) → rain(レイン) → forming(文字点灯)
+        # → title(タイトル完成) → zoom(一文字ずつフェード) → rain ループ
+        # ※ intro は起動時の 1 回だけ。 以降のループは rain から。
+        self._matrix_phase = 'intro'
+        self._matrix_phase_t = 0
+        # タイトル文字を「レインのグリッドのセル」に配置する。
+        # 中央の行に、 数列おきに各文字を割り当てる。 レインの先頭がこのセルの
+        # 行に到達したら点灯 (白固定) する = 本家の「流れてきて止まる」 挙動。
+        title = self._MATRIX_TITLE
+        spacing = 2  # 文字を 2 列おきに置いて間隔を作る
+        col_start = max(0, (cols - len(title) * spacing) // 2)
+        row_t = rows // 2
+        self._matrix_title_cells = []
+        for i, ch in enumerate(title):
+            if ch == ' ':
+                continue
+            col = min(cols - 1, col_start + i * spacing)
+            self._matrix_title_cells.append(
+                {'col': col, 'row': row_t, 'char': ch, 'lit': False, 'ti': i})
+        # PIL 用: 画像参照保持リスト (GC 防止) とフォントパス解決
+        self._matrix_imgs = []
+        self._matrix_resolve_fonts()
+        # zoom フェーズで各文字を消す順番をランダムに決める
+        n_real = sum(1 for ch in self._MATRIX_TITLE if ch != ' ')
+        self._matrix_fade_order = list(range(n_real))
+        random.shuffle(self._matrix_fade_order)
+        self._matrix_animate()
+
+    _MATRIX_CHARS = ('アイウエオカキクケコサシスセソタチツテトナニヌネノ'
+                     'ハヒフヘホマミムメモヤユヨラリルレロワヲン'
+                     'ｱｲｳｴｵｶｷｸｹｺｻｼｽｾｿﾀﾁﾂﾃﾄﾅﾆﾇﾈﾉ'
+                     '0123456789ABCDEFZ:."=*+<>|╌')
+
+    _MATRIX_TITLE = 'THE NET :: SYS'
+    # 日本語フォントが見つからない環境用の英数記号レイン
+    _MX_ASCII_CHARS = '0123456789ABCDEFZ:."=*+<>|/\\!?#%&{}[]'
+    _MATRIX_INTRO = 'Hello chichirou'
+
+    # 各フェーズの長さ (フレーム数, 50ms/frame ≒ 20fps)
+    _MX_RAIN = 90       # レインのみ (約4.5秒)
+    _MX_FORMING = 70    # 文字が中央に1つずつ集まる (約3.5秒)
+    _MX_RAINOUT = 22    # 背景レインがフェードアウト (約1.1秒)
+    _MX_GROW = 45       # 集まった文字が大きくなる (約2.2秒)
+    _MX_VANISH = 70     # 大きい文字を一文字ずつランダム消去 (約3.5秒)
+    _MX_SMALL_H = 20    # 集まったときの文字高 (px)
+    _MX_BIG_H = 62      # 拡大後の文字高 (px)
+
+    def _matrix_draw_rain(self, dim=1.0):
+        """デジタルレインを描画。 dim<1.0 で全体を暗くする (タイトル時の背景用)"""
+        c = self._matrix_canvas
+        cell = self._matrix_cell
+        rows = self._matrix_rows
+        chars = self._MATRIX_CHARS
+        font_n = ('Courier New', 13)
+        font_b = ('Courier New', 13, 'bold')
+        def _dim(hexcol):
+            # '#rrggbb' を dim 倍して暗くする
+            if dim >= 1.0:
+                return hexcol
+            r = int(int(hexcol[1:3], 16) * dim)
+            g = int(int(hexcol[3:5], 16) * dim)
+            b = int(int(hexcol[5:7], 16) * dim)
+            return f'#{r:02x}{g:02x}{b:02x}'
+        for i, col in enumerate(self._matrix_cols_data):
+            head = col['head']
+            trail = col['trail']
+            x = i * cell + cell // 2
+            head_row = int(head)
+            grid_col = self._matrix_grid[i]
+            for t in range(trail):
+                row = head_row - t
+                if row < 0:
+                    break
+                if row >= rows:
+                    continue
+                if random.random() < 0.13:
+                    grid_col[row] = random.choice(chars)
+                ch = grid_col[row]
+                y = row * cell + cell // 2
+                if t == 0:
+                    c.create_text(x, y, text=ch, fill=_dim('#ffffff'), font=font_b)
+                elif t == 1:
+                    c.create_text(x, y, text=ch, fill=_dim('#d8ffd8'), font=font_b)
+                elif t == 2:
+                    c.create_text(x, y, text=ch, fill=_dim('#9dff9d'), font=font_b)
+                elif random.random() < 0.05:
+                    c.create_text(x, y, text=ch, fill=_dim('#7dff7d'), font=font_b)
+                else:
+                    frac = t / max(trail, 1)
+                    shade = max(28, int(235 * (1 - frac)))
+                    c.create_text(x, y, text=ch,
+                                  fill=_dim(f'#00{shade:02x}1a'), font=font_n)
+            col['head'] = head + col['speed']
+            if (head - trail) > rows:
+                col['head'] = random.uniform(-rows // 2, 0)
+                col['speed'] = random.uniform(0.35, 1.1)
+                col['trail'] = random.randint(10, min(rows, 30))
+
+    def _matrix_draw_title_cell(self, tc, glow=True, x=None, y=None,
+                                 size=15, fade=1.0):
+        """タイトル1文字を描画。 既定ではグリッドセル位置・15pt。
+        x,y,size,fade を渡すと任意位置・サイズ・明るさで描ける (zoom の3D投影用)。"""
+        c = self._matrix_canvas
+        cell = self._matrix_cell
+        if x is None:
+            x = tc['col'] * cell + cell // 2
+        if y is None:
+            y = tc['row'] * cell + cell // 2
+        fs = max(1, int(size))
+        font = ('Courier New', fs, 'bold')
+        base = int(255 * max(0.0, min(1.0, fade)))
+        col_main = f'#{int(base*0.9):02x}{base:02x}{int(base*0.9):02x}'
+        if glow:
+            for dx, dy in ((1, 1), (-1, 1), (1, -1), (-1, -1), (2, 0), (-2, 0)):
+                c.create_text(x + dx, y + dy, text=tc['char'],
+                              fill='#1a7a3a', font=font)
+        c.create_text(x, y, text=tc['char'], fill=col_main, font=font)
+
+    def _matrix_resolve_fonts(self):
+        """文字マスク用 (太字英数) とレイン用 (日本語カナ) のフォントパスを探す。"""
+        self._mx_title_font_path = None
+        self._mx_rain_font_path = None
+        if not _MATRIX_PIL:
+            return
+        winf = os.path.join(os.environ.get('WINDIR', r'C:\Windows'), 'Fonts')
+
+        def _find(names):
+            for n in names:
+                p = os.path.join(winf, n)
+                if os.path.exists(p):
+                    return p
+            return None
+
+        # 文字の形 (マスク): 太字の等幅・ゴシック
+        self._mx_title_font_path = _find([
+            'courbd.ttf', 'consolab.ttf', 'cour.ttf', 'consola.ttf',
+            'arialbd.ttf', 'msgothic.ttc', 'meiryob.ttc',
+        ])
+        # レインのカナ: 日本語フォントを幅広く探す
+        self._mx_rain_font_path = _find([
+            'msgothic.ttc', 'YuGothM.ttc', 'YuGothR.ttc', 'yugothic.ttf',
+            'YuGothB.ttc', 'meiryo.ttc', 'meiryob.ttc', 'msmincho.ttc',
+            'BIZ-UDGothicR.ttc', 'BIZ-UDGothicB.ttc', 'msgothic.ttf',
+        ])
+        print(f'[matrix font] title={self._mx_title_font_path} '
+              f'rain={self._mx_rain_font_path}', flush=True)
+
+    def _matrix_make_char_img(self, ch, h_px, fade=1.0):
+        """文字 ch の「形」 の中にデジタルレインを詰めた PhotoImage を返す。
+        文字の輪郭・塗りは描かず、 マスクで切り抜いたレインだけが見える。"""
+        if not _MATRIX_PIL or not self._mx_title_font_path:
+            return None
+        try:
+            h_px = max(8, int(h_px))
+            tfont = _PILFont.truetype(self._mx_title_font_path, h_px)
+            try:
+                bbox = tfont.getbbox(ch)
+            except Exception:
+                bbox = (0, 0, h_px, h_px)
+            w = max(1, bbox[2] - bbox[0])
+            pad = max(2, h_px // 8)
+            W = w + pad * 2
+            H = h_px + pad * 2
+            # レイン層 (文字領域いっぱいに緑の縦流れ)
+            rain = _PILImage.new('RGBA', (W, H), (0, 0, 0, 0))
+            rd = _PILDraw.Draw(rain)
+            mini = max(4, h_px // 6)
+            if self._mx_rain_font_path:
+                # 日本語フォントあり → カナ込みのレイン
+                try:
+                    rfont = _PILFont.truetype(self._mx_rain_font_path, mini)
+                    chars = self._MATRIX_CHARS
+                except Exception:
+                    rfont = tfont
+                    chars = self._MX_ASCII_CHARS
+            else:
+                # 日本語フォントなし → 英数記号のレイン (豆腐を防ぐ)
+                rfont = tfont
+                chars = self._MX_ASCII_CHARS
+            step_x = max(4, int(mini * 0.74))
+            step_y = max(5, int(mini * 1.02))
+            for cx in range(0, W + step_x, step_x):
+                head = random.randint(0, H)        # この列の流れの先頭
+                off = random.randint(0, step_y)
+                yy = -step_y + off
+                while yy < H:
+                    dist = head - yy
+                    if dist < 0:                    # 先頭より下でも明るめ
+                        r, g, b = 10, 130, 45
+                    elif dist < step_y:             # 先頭は白っぽく明るい
+                        r, g, b = 210, 255, 210
+                    else:                           # 尾も暗くしすぎない中緑
+                        br = max(120, 235 - int(dist * 0.5))
+                        r, g, b = int(br * 0.22), br, int(br * 0.32)
+                    rd.text((cx, yy), random.choice(chars),
+                            fill=(r, g, b, 255), font=rfont)
+                    yy += step_y
+            # 文字マスクで切り抜き
+            mask = _PILImage.new('L', (W, H), 0)
+            md = _PILDraw.Draw(mask)
+            md.text((pad - bbox[0], pad - bbox[1]), ch, fill=255, font=tfont)
+            if fade < 0.999:
+                f = max(0.0, min(1.0, fade))
+                mask = mask.point(lambda p: int(p * f))
+            rain.putalpha(mask)
+            # master を明示しないと一部の画像が表示されないことがある
+            return _PILTk.PhotoImage(rain, master=self._matrix_canvas)
+        except Exception as e:
+            print(f'[matrix img] {ch!r} h={h_px}: {type(e).__name__}: {e}')
+            return None
+
+    def _matrix_center_layout(self):
+        """タイトルを画面中央に配置した各文字の中心x (ti→x の dict) と中央y を返す。
+        単語間の空白は文字幅より狭くして、 THE NET :: SYS の語間を詰める。
+        forming/rainout/grow/vanish すべてで同じ位置を使う。"""
+        w = self.root.winfo_width()
+        h = self.root.winfo_height()
+        title = self._MATRIX_TITLE
+        base_w = (w - 16) / max(1, len(title))
+        space_w = base_w * 0.4              # 空白は文字幅の 40% に詰める
+        widths = [space_w if ch == ' ' else base_w for ch in title]
+        total = sum(widths)
+        sx0 = w / 2 - total / 2
+        xs = {}
+        cx = sx0
+        for i, ch in enumerate(title):
+            xs[i] = cx + widths[i] / 2
+            cx += widths[i]
+        return xs, h / 2
+
+    def _matrix_animate(self):
+        if not self._matrix_on or not self._matrix_canvas:
+            return
+        c = self._matrix_canvas
+        c.delete('all')
+        phase = self._matrix_phase
+        t = self._matrix_phase_t
+
+        if phase == 'intro':
+            # 設定テキストを最初の空白で2分割し、 前半 → 間 → 後半とタイプ。
+            # 空白が無ければ全体を1段でタイプ。 末尾に点滅カーソル。
+            text = self._matrix_intro_text or 'Hello chichirou'
+            x0, y0 = 28, 26
+            fs = self._matrix_cell           # レインと同じ大きさ (13)
+            font = ('Courier New', fs, 'bold')
+            cw = fs * 0.66
+            sp = text.find(' ')
+            part1_len = sp if sp > 0 else len(text)   # 前半の文字数
+            pause = 16                       # 前半のあとの間 (約0.8秒)
+            cursor_wait = 30                 # 最初カーソルだけ表示する間 (約1.5秒)
+            if t < cursor_wait:
+                n_shown = 0                  # まだカーソルだけ
+            else:
+                tt = t - cursor_wait
+                if tt < part1_len * 4:
+                    n_shown = tt // 4        # 前半をタイプ中
+                elif tt < part1_len * 4 + pause:
+                    n_shown = part1_len      # 前半完成、 ひと呼吸
+                else:
+                    after = tt - (part1_len * 4 + pause)
+                    n_shown = min(len(text), part1_len + 1 + after // 4)
+            cx = x0
+            for ch in text[:n_shown]:
+                if ch != ' ':
+                    c.create_text(cx, y0, text=ch, fill='#3dff6e',
+                                  font=font, anchor='w')
+                cx += cw
+            # 点滅カーソル (緑の四角)
+            if (t // 6) % 2 == 0:
+                c.create_rectangle(cx, y0 - fs * 0.6,
+                                   cx + fs * 1.0, y0 + fs * 0.6,
+                                   fill='#7dffa0', outline='')
+            # 完了 (全文字 + 余韻) でレインへ
+            done_t = (cursor_wait + part1_len * 4 + pause
+                      + (len(text) - part1_len) * 4 + 24)
+            if t >= done_t:
+                self._matrix_phase = 'rain'
+                self._matrix_phase_t = 0
+            else:
+                self._matrix_phase_t += 1
+
+        elif phase == 'rain':
+            self._matrix_draw_rain()
+            if t >= self._MX_RAIN:
+                self._matrix_phase = 'forming'
+                self._matrix_phase_t = 0
+            else:
+                self._matrix_phase_t += 1
+
+        elif phase == 'forming':
+            # タイトル文字 (形の中がレインの画像) を「画面中央」 に、 ランダムな順で
+            # 1文字ずつふわっとフェードインさせて集める。 集まる位置はこの後の
+            # 拡大・消去と同じ中央なので、 流れが一貫する。
+            self._matrix_draw_rain(dim=0.75)
+            xs, cy = self._matrix_center_layout()
+            sh = self._MX_SMALL_H
+            use_img = _MATRIX_PIL and self._mx_title_font_path
+            self._matrix_imgs = []
+            n = len(self._matrix_title_cells)
+            all_in = True
+            for idx, tc in enumerate(self._matrix_title_cells):
+                order = self._matrix_fade_order[idx % max(1, n)]
+                appear = order / max(1, n) * (self._MX_FORMING * 0.7)
+                cf = max(0.0, min(1.0, (t - appear) / 12.0))
+                if cf < 1.0:
+                    all_in = False
+                if cf <= 0:
+                    continue
+                x = xs[tc['ti']]
+                if use_img:
+                    img = self._matrix_make_char_img(tc['char'], sh, cf)
+                    if img is not None:
+                        c.create_image(x, cy, image=img)
+                        self._matrix_imgs.append(img)
+                        continue
+                self._matrix_draw_title_cell(
+                    tc, glow=True, x=x, y=cy, size=sh, fade=cf)
+            if (all_in and t >= self._MX_FORMING * 0.7) or t >= self._MX_FORMING * 1.5:
+                self._matrix_phase = 'rainout'
+                self._matrix_phase_t = 0
+            else:
+                self._matrix_phase_t += 1
+
+        elif phase == 'rainout':
+            # 背景のレインだけをフェードアウト。 中央の文字はそのまま残す。
+            fo = max(0.0, 1.0 - t / max(1, self._MX_RAINOUT))
+            self._matrix_draw_rain(dim=0.75 * fo)
+            xs, cy = self._matrix_center_layout()
+            sh = self._MX_SMALL_H
+            use_img = _MATRIX_PIL and self._mx_title_font_path
+            self._matrix_imgs = []
+            for tc in self._matrix_title_cells:
+                x = xs[tc['ti']]
+                if use_img:
+                    img = self._matrix_make_char_img(tc['char'], sh, 1.0)
+                    if img is not None:
+                        c.create_image(x, cy, image=img)
+                        self._matrix_imgs.append(img)
+                        continue
+                self._matrix_draw_title_cell(
+                    tc, glow=True, x=x, y=cy, size=sh, fade=1.0)
+            if t >= self._MX_RAINOUT:
+                self._matrix_phase = 'grow'
+                self._matrix_phase_t = 0
+            else:
+                self._matrix_phase_t += 1
+
+        elif phase == 'grow':
+            # レインが消えた黒画面で、 中央の文字が小 → 大へゆっくり拡大。
+            prog = t / max(1, self._MX_GROW)
+            ease = prog * prog * (3 - 2 * prog)
+            cur_h = self._MX_SMALL_H + (self._MX_BIG_H - self._MX_SMALL_H) * ease
+            xs, cy = self._matrix_center_layout()
+            use_img = _MATRIX_PIL and self._mx_title_font_path
+            self._matrix_imgs = []
+            for tc in self._matrix_title_cells:
+                x = xs[tc['ti']]
+                if use_img:
+                    img = self._matrix_make_char_img(tc['char'], cur_h, 1.0)
+                    if img is not None:
+                        c.create_image(x, cy, image=img)
+                        self._matrix_imgs.append(img)
+                        continue
+                self._matrix_draw_title_cell(
+                    tc, glow=True, x=x, y=cy, size=cur_h, fade=1.0)
+            if t >= self._MX_GROW:
+                self._matrix_phase = 'vanish'
+                self._matrix_phase_t = 0
+            else:
+                self._matrix_phase_t += 1
+
+        elif phase == 'vanish':
+            # 大きい文字を、 ランダムな順に1文字ずつフェードアウト。 終わったら
+            # レインに戻ってループ (intro はスキップ)。
+            prog = t / max(1, self._MX_VANISH)
+            xs, cy = self._matrix_center_layout()
+            use_img = _MATRIX_PIL and self._mx_title_font_path
+            self._matrix_imgs = []
+            n_real = len(self._matrix_fade_order)
+            for idx, tc in enumerate(self._matrix_title_cells):
+                rank = self._matrix_fade_order[idx % max(1, n_real)]
+                local = prog * (n_real + 4) - rank
+                fade = 1.0 - max(0.0, min(1.0, local))
+                if fade <= 0:
+                    continue
+                x = xs[tc['ti']]
+                if use_img:
+                    img = self._matrix_make_char_img(tc['char'], self._MX_BIG_H, fade)
+                    if img is not None:
+                        c.create_image(x, cy, image=img)
+                        self._matrix_imgs.append(img)
+                        continue
+                self._matrix_draw_title_cell(
+                    tc, glow=True, x=x, y=cy, size=self._MX_BIG_H, fade=fade)
+            if t >= self._MX_VANISH:
+                self._matrix_phase = 'rain'
+                self._matrix_phase_t = 0
+                self._matrix_imgs = []
+                random.shuffle(self._matrix_fade_order)
+            else:
+                self._matrix_phase_t += 1
+
+        self._matrix_after = self.root.after(50, self._matrix_animate)
+
+    def _matrix_off(self):
+        self._matrix_on = False
+        self._matrix_imgs = []
+        if self._matrix_after:
+            try: self.root.after_cancel(self._matrix_after)
+            except Exception: pass
+            self._matrix_after = None
+        if self._matrix_canvas:
+            try: self._matrix_canvas.destroy()
+            except Exception: pass
+            self._matrix_canvas = None
+
     def _is_geometry_visible(self, geom):
         """保存されていたジオメトリが現在の画面範囲内かチェック"""
         try:
@@ -4319,9 +4946,17 @@ class NetSysApp:
             return False
 
     def _save_geometry(self):
-        """現在のウィンドウ位置とサイズを保存"""
+        """現在のウィンドウ位置とサイズを保存。 位置 (X,Y)・幅は geometry() から、
+        高さは winfo_height() の実寸を使う (要求値ではなく実際の表示高さを記憶)。"""
         try:
+            import re
+            self.root.update_idletasks()
             geom = self.root.geometry()  # "WIDTHxHEIGHT+X+Y"
+            h = self.root.winfo_height()  # 実際に表示されている高さ
+            m = re.match(r'(\d+)x(\d+)\+(-?\d+)\+(-?\d+)', geom)
+            if m and h and h > 100:
+                w, _reqh, x, y = m.groups()
+                geom = f"{w}x{h}+{x}+{y}"  # 高さだけ実寸に差し替え
             self.config['geometry'] = geom
             save_config(self.config)
         except Exception as e:
@@ -4828,8 +5463,10 @@ class NetSysApp:
         gpu_temp_hist = e.get('gpu_temp_history') or []
 
         # usage が取れているか
+        # ★ 0% は「アイドル」という有効な値。 u > 0 で除外すると GPU アイドル時に
+        #   「データ無し」と誤判定され no data になるため、 None だけを除外する。
         usage_filtered = [u for u in (usage_hist or [])
-                           if u is not None and u > 0]
+                           if u is not None]
         has_usage = bool(usage_filtered)
 
         # 追加シリーズを構築する共通関数
@@ -5049,6 +5686,84 @@ class NetSysApp:
             animated=True,
         )
 
+    def _fetch_geo(self):
+        """グローバルIP と位置情報を ip-api.com から取得 (バックグラウンド)。
+        位置はほぼ変わらないので起動時に1回だけ取得する。"""
+        import urllib.request
+        try:
+            req = urllib.request.Request(
+                'http://ip-api.com/json/',
+                headers={'User-Agent': 'net-sys-monitor'})
+            with urllib.request.urlopen(req, timeout=6) as r:
+                d = json.loads(r.read().decode('utf-8'))
+            if d.get('status') == 'success':
+                self._geo_data = d
+                try:
+                    self.root.after(0, self._update_geo_labels)
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"[geo] {e}")
+            try:
+                self.root.after(0, self._geo_failed)
+            except Exception:
+                pass
+
+    def _geo_failed(self):
+        if hasattr(self, 'lbl_global_ip'):
+            self.lbl_global_ip.config(text='Global IP  取得失敗', fg=DIM)
+
+    def _update_geo_labels(self):
+        d = getattr(self, '_geo_data', None)
+        if not d or not hasattr(self, 'lbl_global_ip'):
+            return
+        ip = d.get('query', '--')
+        self.lbl_global_ip.config(text=f'Global IP  {ip}', fg=YELLOW)
+        parts = [d.get('city', ''), d.get('regionName', ''),
+                 d.get('country', '')]
+        loc = ', '.join(x for x in parts if x)
+        isp = d.get('isp', '')
+        segs = []
+        if loc:
+            segs.append(f'Loc {loc}')
+        if isp:
+            segs.append(f'ISP {isp}')
+        self.lbl_geo_loc.config(text='  /  '.join(segs))
+
+    def _update_power_cost(self, d):
+        """CPU+GPU の消費電力 (LHM) から電気代を計算して POWER カードを更新"""
+        if not hasattr(self, 'lbl_power_watt'):
+            return  # カードが配置されていない (古い config 等)
+        cpu_pw = d.get('cpu_power')
+        gpu_pw = (d.get('gpu_extras') or {}).get('power')
+        total_w = (cpu_pw or 0) + (gpu_pw or 0)
+
+        # 積算 (経過時間ぶんの電力量を足す)
+        now = time.time()
+        dt = now - self._power_last_t
+        self._power_last_t = now
+        # dt が異常 (スリープ復帰など) の場合は積算スキップ
+        if 0 < dt < 10 and total_w > 0:
+            self._power_accum_wh += total_w * dt / 3600.0
+            self._power_elapsed_s += dt
+
+        rate = self._power_rate_yen
+        if total_w > 0:
+            self.lbl_power_watt.config(text=f'{total_w:.0f} W', fg=ACCENT)
+            today_yen = self._power_accum_wh / 1000.0 * rate
+            self.lbl_power_today.config(text=f'今日 ¥{today_yen:.1f}', fg=YELLOW)
+            if self._power_elapsed_s > 0:
+                avg_w = self._power_accum_wh * 3600.0 / self._power_elapsed_s
+                month_yen = avg_w / 1000.0 * 24 * 30 * rate
+                self.lbl_power_month.config(text=f'月予測 ¥{month_yen:.0f}')
+            self.lbl_power_rate.config(text=f'@¥{rate}/kWh')
+        else:
+            # 電力データが取れない (LHM 非対応 or CPU/GPU 電力センサーなし)
+            self.lbl_power_watt.config(text='N/A', fg=DIM)
+            self.lbl_power_today.config(text='// 電力データなし', fg=DIM)
+            self.lbl_power_month.config(text='')
+            self.lbl_power_rate.config(text='要 LHM 電力センサー')
+
     def _update_battery(self):
         """バッテリー/UPS 情報を更新"""
         if not hasattr(self, 'donut_battery'):
@@ -5065,7 +5780,7 @@ class NetSysApp:
                                           label='N/A',
                                           sublabel='no batt')
             if hasattr(self, 'lbl_battery_status'):
-                self.lbl_battery_status.config(text='// desktop / no battery',
+                self.lbl_battery_status.config(text='// no batt',
                                                  fg=DIM)
             if hasattr(self, 'lbl_battery_time'):
                 self.lbl_battery_time.config(text='')
@@ -5459,7 +6174,8 @@ class NetSysApp:
             'gpu':           {'title': 'GPU',         'builder': self._build_sec_gpu,            'default_row': 3,  'default_span': 'full'},
             'motherboard':   {'title': 'MOTHERBOARD', 'builder': self._build_sec_motherboard,    'default_row': 4,  'default_span': 'full'},
             'net_traffic':   {'title': 'NET TRAFFIC', 'builder': self._build_sec_net_traffic,    'default_row': 5,  'default_span': 'full'},
-            'battery':       {'title': 'BATTERY',     'builder': self._build_sec_battery,        'default_row': 7,  'default_span': 'half'},
+            'battery':       {'title': 'BATTERY',     'builder': self._build_sec_battery,        'default_row': 7,  'default_span': 'third'},
+            'power_cost':    {'title': 'POWER',       'builder': self._build_sec_power_cost,     'default_row': 7,  'default_span': 'third'},
         }
 
         # 削除: cards_container.grid_rowconfigure(0, minsize=180)
@@ -5832,12 +6548,20 @@ class NetSysApp:
         self.lbl_nic_name.pack(fill='x', pady=0)
         self.lbl_nic_ipv4 = tk.Label(nic_info, text='---',
                                        bg=PANEL, fg=ACCENT,
-                                       font=FONT_MONO_XS, anchor='w')
+                                       font=FONT_TINY, anchor='w')
         self.lbl_nic_ipv4.pack(fill='x', pady=(2, 0))
-        self.lbl_nic_ipv6 = tk.Label(nic_info, text='---',
-                                       bg=PANEL, fg=ACCENT,
-                                       font=FONT_MONO_XS, anchor='w')
-        self.lbl_nic_ipv6.pack(fill='x', pady=0)
+
+        # ── グローバルIP + 位置情報 (外部 API で取得) ──
+        tk.Frame(nic_info, bg=BORDER, height=1).pack(fill='x', pady=(6, 4))
+        self.lbl_global_ip = tk.Label(nic_info, text='Global IP  検索中...',
+                                        bg=PANEL, fg=YELLOW,
+                                        font=FONT_MONO_XS, anchor='w')
+        self.lbl_global_ip.pack(fill='x', pady=0)
+        self.lbl_geo_loc = tk.Label(nic_info, text='',
+                                      bg=PANEL, fg=MUTED,
+                                      font=FONT_MONO_XS, anchor='w',
+                                      wraplength=410, justify='left')
+        self.lbl_geo_loc.pack(fill='x', pady=(2, 0))
 
     def _build_sec_disk_io(self, parent):
         """DISK I/O チャート"""
@@ -6036,24 +6760,63 @@ class NetSysApp:
         """バッテリー/UPS 情報 (検出されない場合はメッセージ表示)"""
         panel = styled_panel(parent)
         panel.pack(fill='both', expand=True, padx=4, pady=2)
-        # half 幅 (約 200px) では accent text を入れると右側が切れるので省略
-        section_header(panel, 'BATTERY').pack(fill='x')
+        # third 幅 (~150px) では FONT_HEAD だとヘッダーが見切れるので小フォント
+        section_header(panel, 'BATTERY',
+                       title_font=("Courier New", 9, "bold")).pack(fill='x')
 
         body = tk.Frame(panel, bg=PANEL)
-        body.pack(fill='x', padx=8, pady=(2, 8))
+        body.pack(fill='x', padx=8, pady=(0, 4))
 
-        self.donut_battery = DonutChart(body, size=100, thickness=8)
-        self.donut_battery.pack(pady=(2, 4))
+        # third 幅に収まるようドーナツを縮小 (100 → 72)
+        self.donut_battery = DonutChart(body, size=72, thickness=7)
+        self.donut_battery.pack(pady=(0, 2))
 
         self.lbl_battery_status = tk.Label(body, text='// detecting...',
                                              bg=PANEL, fg=DIM,
-                                             font=FONT_MONO_XS, anchor='center')
+                                             font=FONT_MONO_XS, anchor='center',
+                                             wraplength=130)
         self.lbl_battery_status.pack(fill='x')
 
         self.lbl_battery_time = tk.Label(body, text='',
                                            bg=PANEL, fg=MUTED,
-                                           font=FONT_MONO_XS, anchor='center')
-        self.lbl_battery_time.pack(fill='x', pady=(2, 0))
+                                           font=FONT_MONO_XS, anchor='center',
+                                           wraplength=130)
+        self.lbl_battery_time.pack(fill='x', pady=(1, 0))
+
+    def _build_sec_power_cost(self, parent):
+        """電力消費と電気代の見積もり (LHM の CPU/GPU 電力から計算)"""
+        panel = styled_panel(parent)
+        panel.pack(fill='both', expand=True, padx=4, pady=2)
+        # third 幅 (~150px) 用に小フォントのヘッダー
+        section_header(panel, 'POWER',
+                       title_font=("Courier New", 9, "bold")).pack(fill='x')
+
+        body = tk.Frame(panel, bg=PANEL)
+        body.pack(fill='x', padx=8, pady=(0, 4))
+
+        # 現在の消費電力 (third 幅に合わせて 18pt)
+        self.lbl_power_watt = tk.Label(body, text='-- W', bg=PANEL, fg=ACCENT,
+                                        font=("Courier New", 18, 'bold'),
+                                        anchor='center')
+        self.lbl_power_watt.pack(fill='x', pady=(2, 0))
+        tk.Label(body, text='CPU + GPU', bg=PANEL, fg=DIM,
+                 font=FONT_MONO_XS, anchor='center').pack(fill='x')
+
+        # 今日 (起動から) の累積電気代
+        self.lbl_power_today = tk.Label(body, text='今日 ¥--', bg=PANEL,
+                                         fg=YELLOW, font=FONT_MONO_S,
+                                         anchor='center', wraplength=130)
+        self.lbl_power_today.pack(fill='x', pady=(3, 0))
+        # 月額予測 (短縮表記)
+        self.lbl_power_month = tk.Label(body, text='月予測 ¥--', bg=PANEL,
+                                         fg=MUTED, font=FONT_MONO_XS,
+                                         anchor='center', wraplength=130)
+        self.lbl_power_month.pack(fill='x', pady=(1, 0))
+        # 単価表示
+        self.lbl_power_rate = tk.Label(body, text='', bg=PANEL, fg=DIM,
+                                        font=FONT_MONO_XS, anchor='center',
+                                        wraplength=130)
+        self.lbl_power_rate.pack(fill='x', pady=(1, 0))
 
     def _toggle_dashboard_edit_mode(self):
         """ダッシュボードの編集モードを切り替え"""
@@ -6713,9 +7476,52 @@ class NetSysApp:
             except Exception as e:
                 print(f"[alert settings panel] {e}")
 
+        # ── Matrix モード intro テキスト ──
+        matrix_panel = styled_panel(inner)
+        matrix_panel.grid(row=7, column=0, sticky='ew', padx=8, pady=4)
+        section_header(matrix_panel, 'MATRIX INTRO',
+                       accent_text='[ type "matrix" ]').pack(fill='x')
+        mi = tk.Frame(matrix_panel, bg=PANEL)
+        mi.pack(fill='x', padx=12, pady=(0, 12))
+        self.matrix_intro_var = tk.StringVar(value=self._matrix_intro_text)
+        m_entry = tk.Entry(mi, textvariable=self.matrix_intro_var,
+                           bg=SURFACE, fg=TEXT, font=FONT_MONO_S,
+                           insertbackground=ACCENT, relief='flat', bd=0)
+        m_entry.pack(fill='x', ipady=5)
+
+        def _save_intro(*_):
+            val = self.matrix_intro_var.get().strip() or 'Hello chichirou'
+            self._matrix_intro_text = val
+            self.config['matrix_intro_text'] = val
+            save_config(self.config)
+
+        m_entry.bind('<FocusOut>', _save_intro)
+        m_entry.bind('<Return>', _save_intro)
+        tk.Label(mi, text='// 起動演出のテキスト。 最初の空白で2段に分かれます',
+                 bg=PANEL, fg=DIM, font=FONT_MONO_XS,
+                 anchor='w', justify='left').pack(fill='x', pady=(6, 0))
+
+        # 文字内レイン用フォントの検出状況 (デバッグ表示)
+        try:
+            self._matrix_resolve_fonts()
+        except Exception:
+            pass
+        if not _MATRIX_PIL:
+            fdesc = 'PIL 未導入 → 文字内レイン無効 (pip install Pillow)'
+        else:
+            rain = getattr(self, '_mx_rain_font_path', None)
+            title = getattr(self, '_mx_title_font_path', None)
+            rb = os.path.basename(rain) if rain else 'なし(英数表示)'
+            tb = os.path.basename(title) if title else 'なし'
+            fdesc = f'mask={tb} / rain={rb}'
+        tk.Label(mi, text=f'// 文字フォント: {fdesc}',
+                 bg=PANEL, fg=MUTED, font=FONT_MONO_XS,
+                 anchor='w', justify='left', wraplength=400).pack(
+            fill='x', pady=(2, 0))
+
         # ── 設定ファイルパス情報 ──
         info_panel = styled_panel(inner)
-        info_panel.grid(row=7, column=0, sticky='ew', padx=8, pady=(4, 4))
+        info_panel.grid(row=8, column=0, sticky='ew', padx=8, pady=(4, 4))
         section_header(info_panel, 'CONFIG FILE').pack(fill='x')
         tk.Label(info_panel, text=CONFIG_PATH,
                  bg=PANEL, fg=MUTED, font=FONT_MONO_XS,
@@ -6724,7 +7530,7 @@ class NetSysApp:
 
         # ── ハードウェアセンサー拡張案内 ──
         sensor_panel = styled_panel(inner)
-        sensor_panel.grid(row=8, column=0, sticky='ew', padx=8, pady=(4, 8))
+        sensor_panel.grid(row=9, column=0, sticky='ew', padx=8, pady=(4, 8))
         section_header(sensor_panel, 'EXTEND SENSORS',
                        accent_text='[ optional tools ]').pack(fill='x')
 
@@ -7381,8 +8187,7 @@ class NetSysApp:
         #   個別 NIC                → その NIC の IPv4/IPv6/MAC
         if self._selected_nic == 'ALL':
             self.lbl_nic_name.config(text='// ALL interfaces (aggregated)')
-            self.lbl_nic_ipv4.config(text='IPv4  ---', fg=DIM)
-            self.lbl_nic_ipv6.config(text='IPv6  ---', fg=DIM)
+            self.lbl_nic_ipv4.config(text='IPv4 --- / IPv6 ---', fg=DIM)
         elif self._selected_nic in ('IPv4 (pkts)', 'IPv6 (pkts)'):
             # プロトコル別選択: そのプロトコルの全 NIC アドレスを列挙
             is_ipv4_mode = self._selected_nic == 'IPv4 (pkts)'
@@ -7403,28 +8208,24 @@ class NetSysApp:
                 return ', '.join(shown)
             if is_ipv4_mode:
                 self.lbl_nic_ipv4.config(
-                    text=f'IPv4  {_join_short(v4_addrs)}',
+                    text=f'IPv4 {_join_short(v4_addrs)}',
                     fg=ACCENT if v4_addrs else DIM)
-                self.lbl_nic_ipv6.config(text='IPv6  ---', fg=DIM)
             else:
-                self.lbl_nic_ipv4.config(text='IPv4  ---', fg=DIM)
-                self.lbl_nic_ipv6.config(
-                    text=f'IPv6  {_join_short(v6_addrs)}',
+                self.lbl_nic_ipv4.config(
+                    text=f'IPv6 {_join_short(v6_addrs)}',
                     fg=ACCENT if v6_addrs else DIM)
         else:
             nic = self._last_nics_map.get(self._selected_nic) if self._selected_nic else None
             if nic:
                 speed = f"  ·  {nic['speed']}M" if nic.get('speed') else ''
                 self.lbl_nic_name.config(text=f"{nic['name']}{speed}")
+                v4 = nic.get('ipv4') or '---'
+                v6 = nic.get('ipv6') or '---'
                 self.lbl_nic_ipv4.config(
-                    text=f"IPv4  {nic.get('ipv4') or '---'}", fg=ACCENT)
-                self.lbl_nic_ipv6.config(
-                    text=f"IPv6  {nic.get('ipv6') or '---'}",
-                    fg=ACCENT if nic.get('ipv6') else DIM)
+                    text=f"IPv4 {v4} / IPv6 {v6}", fg=ACCENT)
             else:
                 self.lbl_nic_name.config(text='// no interface selected')
-                self.lbl_nic_ipv4.config(text='IPv4  ---', fg=DIM)
-                self.lbl_nic_ipv6.config(text='IPv6  ---', fg=DIM)
+                self.lbl_nic_ipv4.config(text='IPv4 --- / IPv6 ---', fg=DIM)
 
         # ── DISK I/O ──
         dio_side = [
@@ -7517,6 +8318,9 @@ class NetSysApp:
         try:
             self._update_battery()
         except Exception as ex: print(f"[battery] {ex}")
+        try:
+            self._update_power_cost(d)
+        except Exception as ex: print(f"[power cost] {ex}")
 
         # ── GPU カードを毎秒更新 ──
         # live() に gpu データが入っていれば、_update_gpu_combined を呼んで
@@ -7683,6 +8487,7 @@ class NetSysApp:
             task_cpu_name,
             task_heavy,      # extras, disks, nics, procs, pdisks
             task_details,    # CPU/DIMM/Disk/GPU 詳細 (DASHBOARD で DIMM 使用、 起動時必須)
+            self._fetch_geo, # グローバルIP + 位置情報 (ip-api.com)
             # task_security は lazy load に変更 (起動高速化、 約 1.5 秒短縮)
             # security は PROCS & SECURITY タブでしか使われない → タブ初回切替時に取得
         ]
@@ -7922,7 +8727,9 @@ class NetSysApp:
                 self._selected_nic = 'ALL'
                 _select('ALL')
 
-            # 初回のみ: ノート PC (バッテリー搭載) なら WiFi NIC をデフォルトに
+            # 初回のみ: マシン種別に応じてデフォルト NIC を選択。
+            #   ノート PC (バッテリー搭載)     → WiFi
+            #   デスクトップ (バッテリーなし)  → Ethernet
             # 以降 (ユーザーが他を選んだ後) は再適用しない (_nic_default_applied フラグ)
             if not self._nic_default_applied:
                 self._nic_default_applied = True
@@ -7931,15 +8738,25 @@ class NetSysApp:
                 except Exception:
                     has_battery = False
                 if has_battery:
-                    # 名前に Wi-Fi / WiFi / Wireless / WLAN を含むものを WiFi NIC とみなす
-                    wifi_nic = next(
+                    # ノート: Wi-Fi / WiFi / Wireless / WLAN を含む NIC をデフォルトに
+                    default_nic = next(
                         (n for n in names
                          if any(kw in n.lower()
                                 for kw in ('wi-fi', 'wifi', 'wireless', 'wlan'))),
                         None)
-                    if wifi_nic:
-                        self._selected_nic = wifi_nic
-                        _select(wifi_nic)
+                else:
+                    # デスクトップ: Ethernet / イーサネット を含む NIC をデフォルトに
+                    # ('lan' は 'wlan'(WiFi) に誤マッチするので使わない)
+                    # (loopback や仮想 NIC は real_nics で既に除外済み)
+                    default_nic = next(
+                        (n for n in names
+                         if any(kw in n.lower()
+                                for kw in ('ethernet', 'イーサネット'))
+                         and n not in ('ALL', 'IPv4 (pkts)', 'IPv6 (pkts)')),
+                        None)
+                if default_nic:
+                    self._selected_nic = default_nic
+                    _select(default_nic)
 
         # ── DASHBOARD: TOP プロセス ──
         top_procs = procs[:8]
@@ -8334,6 +9151,7 @@ class NetSysApp:
         bg_bar_labels = None
         bg_bar_sublabels = None
         bg_bar_label_colors = None
+        bg_bar_colors = None
         if temps:
             # 50℃を上限スケール、超えたら動的拡張
             observed_max = max(t['value'] for t in temps)
@@ -8343,14 +9161,22 @@ class NetSysApp:
             bg_bar_labels = []
             bg_bar_sublabels = []
             bg_bar_label_colors = []
+            bg_bar_colors = []
             for t in temps:
                 val = t['value']
                 # 0-100% に正規化
                 pct = max(0, min(100, (val / scale_max) * 100))
                 bg_bars.append(pct)
-                # 温度値の色は白統一 (バー色がグレーブルーで暗いので、白がよく見える)
-                label_c = '#ffffff'
-                bg_bar_label_colors.append(label_c)
+                # 温度に応じてバー色を変える (暗めのトーンで主張を抑える)
+                if val >= 70:
+                    bar_c = '#8a3535'   # 暗い赤
+                elif val >= 55:
+                    bar_c = '#8a7a2d'   # 暗い黄土
+                else:
+                    bar_c = '#2d6a78'   # 暗いシアン
+                bg_bar_colors.append(bar_c)
+                # 温度値の色は白統一
+                bg_bar_label_colors.append('#ffffff')
                 bg_bar_labels.append(f"{val:.0f}°C")
                 bg_bar_sublabels.append(f"T{t.get('idx', '?')}")
 
@@ -8360,11 +9186,10 @@ class NetSysApp:
                 series, max_pct=y_max,
                 side_pane=side_pane, side_width=75,
                 bg_bars=bg_bars,
-                # bg_bar_colors を指定しない → デフォルトの '#5a7090' (CPU LOAD と同じ)
+                bg_bar_colors=bg_bar_colors,
                 bg_bar_labels=bg_bar_labels,
                 bg_bar_label_colors=bg_bar_label_colors,
                 bg_bar_sublabels=bg_bar_sublabels,
-                # stipple を指定しない → 透明化なし
             )
         else:
             self.chart_fans.set_series([],
