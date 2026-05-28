@@ -42,6 +42,28 @@ import threading
 from datetime import datetime
 from collections import deque
 
+# ── pywin32 (WMI を Python から直接叩く、 PowerShell より劇的に速い) ──
+# Windows のみ。なければ subprocess + powershell フォールバック (互換性維持)
+_PYWIN32_AVAILABLE = False
+_pywin32_wmi_module = None
+if platform.system() == 'Windows':
+    try:
+        import wmi as _pywin32_wmi_module
+        _PYWIN32_AVAILABLE = True
+    except ImportError:
+        try:
+            print("pywin32 をインストールします (起動高速化のため、初回のみ)...")
+            subprocess.check_call([sys.executable, '-m', 'pip',
+                                    'install', '--quiet', 'pywin32', 'wmi'])
+            import wmi as _pywin32_wmi_module
+            _PYWIN32_AVAILABLE = True
+            # pywin32 の post install (pywin32_postinstall.py) は実行不要
+            # wmi モジュールは内部で pythoncom を使うが、ほとんどの場合自動初期化
+        except Exception as _e:
+            print(f"pywin32 インストール失敗: {_e}")
+            print(f"PowerShell フォールバックで動作します (起動が遅くなります)")
+
+
 import tkinter as tk
 from tkinter import ttk, messagebox
 
@@ -399,25 +421,145 @@ class Collector:
         psutil.cpu_percent(interval=None, percpu=True)
         self._details = {'data': None, 't': 0}
         self._security = {'data': None, 't': 0}
-        # GPU/CPU温度の取得能力チェック
-        self._gpu_available = self._check_gpu()
-        self._temp_available = None  # 初回呼出時に判定
-        # GPU VRAM 総量（Win32 から起動時に取得）
-        self._vram_total_bytes = self._get_vram_total()
+        # GPU/CPU 温度の取得能力チェック → 遅延化 (これらは PowerShell を呼ぶので
+        # 各 3-9 秒かかる。起動時にメインスレッドを止めるのは大きな遅延の原因)
+        # 初回呼び出し時に判定するように None で初期化
+        self._gpu_available = None
+        self._gpu_cmd = None
+        self._gpu_method = None
+        self._temp_available = None
+        # VRAM 総量も遅延取得 (None なら未取得状態)
+        self._vram_total_bytes = None
+        # details() の並列重複実行を防ぐ lock
+        # task_heavy (pdisks 取得用) と task_details が同時に details() を呼ぶ場合、
+        # 両方ともキャッシュ未取得 → 両方とも 4 サブクエリ実行 → 2 重実行で遅くなる。
+        # lock + double-check で 1 回だけ実行、 もう片方は cache を待って取得。
+        self._details_lock = threading.Lock()
+        # LHM HTTP 取得用 lock。 起動時に task_lhm (check_lhm_running) と
+        # task_heavy (extras→_get_lhm_metrics) が同時に LHM HTTP を叩くと、
+        # キャッシュが空のため両方が実 HTTP リクエストを発行して競合する。
+        # lock + double-check で実 HTTP は 1 回だけにし、 もう片方はキャッシュを使う。
+        self._lhm_http_lock = threading.Lock()
+        # 初回 extras() で smartctl をスキップして起動高速化するためのフラグ
+        # smartctl は外部 .exe で 0.5-1.5 秒食うため、 起動時は LHM 経由だけで返す。
+        # 2 回目以降の _tick_heavy (起動 5 秒後) で smartctl も取得。
+        self._extras_initial = True
+        # 初回 live() で LHM HTTP 取得をスキップして first paint を高速化するフラグ
+        # LHM HTTP の初回取得は数百ms〜1秒かかり first paint を遅らせる。
+        # 2 回目以降の _tick_live (起動 1 秒後) で取得する。
+        self._live_initial = True
+        # WMI 接続のキャッシュ (スレッドローカル)
+        # pywin32 の wmi モジュールは内部で COM を使うので、各スレッドで初期化が必要
+        self._wmi_local = threading.local()
+        # バックグラウンドで GPU/VRAM チェックを実行 (初回 live() より前に完了する想定)
+        threading.Thread(target=self._init_gpu_detection_async,
+                          daemon=True, name='GPUDetect').start()
+
+    def _wmi(self, namespace='root\\cimv2'):
+        """スレッドごとの WMI 接続を取得 (キャッシュ)。
+        pywin32 が無い、もしくは Windows 以外なら None を返す。"""
+        if not _PYWIN32_AVAILABLE:
+            return None
+        # スレッドローカルにキャッシュ
+        key = f'wmi_{namespace}'
+        cached = getattr(self._wmi_local, key, None)
+        if cached is not None:
+            return cached
+        try:
+            # 各スレッドで pythoncom 初期化が必要
+            import pythoncom
+            try:
+                pythoncom.CoInitialize()
+            except Exception:
+                pass
+            c = _pywin32_wmi_module.WMI(namespace=namespace)
+            setattr(self._wmi_local, key, c)
+            return c
+        except Exception as e:
+            # 初期化失敗 (権限等) → None を返して PowerShell フォールバック
+            print(f"[wmi init {namespace}] {e}")
+            return None
+
+    def _wmi_query(self, wmi_class, properties=None, where=None,
+                    namespace='root\\cimv2'):
+        """WMI クエリを実行して dict のリストを返す。
+        例:
+            _wmi_query('Win32_Processor', ['Name', 'NumberOfCores'])
+            → [{'Name': 'AMD Ryzen...', 'NumberOfCores': 6}]
+        pywin32 が使えない場合は None を返す (呼び出し側が PowerShell へフォールバック)
+        """
+        c = self._wmi(namespace)
+        if c is None:
+            return None
+        try:
+            cls = getattr(c, wmi_class)
+            if where:
+                items = cls(**where)
+            else:
+                items = cls()
+            result = []
+            for item in items:
+                if properties:
+                    row = {p: getattr(item, p, None) for p in properties}
+                else:
+                    # すべてのプロパティを返す (動的)
+                    row = {}
+                    for p in item.properties.keys():
+                        try:
+                            row[p] = getattr(item, p)
+                        except Exception:
+                            row[p] = None
+                result.append(row)
+            return result
+        except Exception as e:
+            print(f"[wmi query {wmi_class}] {e}")
+            return None
+
+    def _init_gpu_detection_async(self):
+        """GPU 検出と VRAM 取得をバックグラウンドで実行 (PowerShell が重いため)"""
+        try:
+            self._gpu_available = self._check_gpu()
+        except Exception as e:
+            print(f"[gpu detect] {e}")
+            self._gpu_available = False
+        try:
+            self._vram_total_bytes = self._get_vram_total()
+        except Exception as e:
+            print(f"[vram detect] {e}")
+            self._vram_total_bytes = None
+        # LHM HTTP センサーを prefetch してキャッシュを温めておく。
+        # 起動直後 (Collector 生成時) にこのスレッドで 1 回取得しておくことで、
+        # bg_init の task_lhm (check_lhm_running) と extras (_get_lhm_metrics) が
+        # キャッシュヒットになり、 LHM HTTP の初回取得が複数タスクで競合するのを防ぐ。
+        try:
+            self._get_lhm_http_sensors()
+        except Exception as e:
+            print(f"[lhm prefetch] {e}")
 
     def _proto_stats_loop(self):
         """バックグラウンドで IPv4/IPv6 プロトコル統計を 2 秒毎に取得し
-        _proto_cache_snapshot を更新する。live() はこのスナップショットを読む。"""
-        # 初回は少し待ってからスタート (起動時のロード負荷を下げる)
-        time.sleep(1.0)
+        _proto_cache_snapshot を更新する。live() はこのスナップショットを読む。
+        - 起動直後の負荷を避けるため 3 秒待ってから開始
+        - 3 回連続で失敗したらループ停止 (Windows の権限/仕様で取れない環境では諦め)
+        """
+        time.sleep(3.0)  # 起動高速化: 重い PowerShell を起動直後にぶつけない
+        consecutive_fail = 0
         while not self._proto_thread_stop:
             try:
                 snap = self._get_proto_stats()
                 if snap:
                     self._proto_cache_snapshot = snap
-            except Exception as e:
-                # 失敗してもループは続ける (一度だけログ)
-                pass
+                    consecutive_fail = 0
+                else:
+                    consecutive_fail += 1
+            except Exception:
+                consecutive_fail += 1
+            # 3 回連続で失敗 (= 6 秒) したらこの環境では取れないと判断して終了
+            if consecutive_fail >= 3:
+                if not getattr(self, '_proto_quit_logged', False):
+                    print("[proto stats] giving up after 3 failures (not available on this system)")
+                    self._proto_quit_logged = True
+                return
             # 2 秒インターバル (アプリの体感には十分追従)
             for _ in range(20):  # 100ms × 20 = 2s だが、中断可能
                 if self._proto_thread_stop:
@@ -441,7 +583,34 @@ class Collector:
             {'ipv4': {'rx_bytes': 0, 'tx_bytes': 0, 'rx_pkts': N, 'tx_pkts': N},
              'ipv6': {...}} または取得失敗時は {}
         """
-        # 1 回の PowerShell で IPv4 + IPv6 両方取得
+        # pywin32 (WMI) で直接取得 (PowerShell より圧倒的に速い)
+        v4_rows = self._wmi_query('Win32_PerfRawData_Tcpip_IPv4',
+            ['DatagramsReceivedPersec', 'DatagramsSentPersec'])
+        v6_rows = self._wmi_query('Win32_PerfRawData_Tcpip_IPv6',
+            ['DatagramsReceivedPersec', 'DatagramsSentPersec'])
+
+        if v4_rows is not None or v6_rows is not None:
+            # WMI 経路: 配列の先頭 (システム全体集計)
+            def _first(rs, key):
+                if rs and len(rs) > 0:
+                    v = rs[0].get(key)
+                    try: return int(v) if v is not None else 0
+                    except (ValueError, TypeError): return 0
+                return 0
+            return {
+                'ipv4': {
+                    'rx_bytes': 0, 'tx_bytes': 0,
+                    'rx_pkts':  _first(v4_rows, 'DatagramsReceivedPersec'),
+                    'tx_pkts':  _first(v4_rows, 'DatagramsSentPersec'),
+                },
+                'ipv6': {
+                    'rx_bytes': 0, 'tx_bytes': 0,
+                    'rx_pkts':  _first(v6_rows, 'DatagramsReceivedPersec'),
+                    'tx_pkts':  _first(v6_rows, 'DatagramsSentPersec'),
+                },
+            }
+
+        # フォールバック: PowerShell (pywin32 が無い場合)
         ps_script = (
             "$ErrorActionPreference='Stop'; "
             "$v4 = Get-CimInstance Win32_PerfRawData_Tcpip_IPv4; "
@@ -459,7 +628,6 @@ class Collector:
                 self._proto_warned = True
             return {}
 
-        # 出力例: "2727673,1968728,12345,5678"
         for line in out.strip().splitlines():
             parts = line.strip().split(',')
             if len(parts) == 4:
@@ -470,7 +638,7 @@ class Collector:
                     v6_tx = int(parts[3])
                     return {
                         'ipv4': {
-                            'rx_bytes': 0, 'tx_bytes': 0,  # バイト数は OS が提供しない
+                            'rx_bytes': 0, 'tx_bytes': 0,
                             'rx_pkts':  v4_rx, 'tx_pkts': v4_tx,
                         },
                         'ipv6': {
@@ -655,12 +823,18 @@ class Collector:
 
             # LHMから per-core 情報を取得（軽い：1秒キャッシュ）
             # GPU 関連メトリクスも LHM から取れるものは毎秒更新する
+            # ★ 初回 live() のみ LHM HTTP をスキップして first paint を高速化する。
+            # LHM HTTP の初回取得 (キャッシュ無し) は数百ms〜1秒かかるため。
+            # 2 回目以降の _tick_live (起動 1 秒後) で取得 → CPU温度/GPU等は1秒遅れで表示。
             core_voltages = []
             core_clocks = []
             core_temps = []
             live_gpu_usage = None
             live_gpu_extras = None
-            lhm = self._get_lhm_metrics()
+            skip_lhm = self._live_initial
+            if self._live_initial:
+                self._live_initial = False
+            lhm = None if skip_lhm else self._get_lhm_metrics()
             if lhm:
                 core_voltages = lhm.get('core_voltages', []) or []
                 core_clocks = lhm.get('core_clocks', []) or []
@@ -773,12 +947,11 @@ class Collector:
         except Exception:
             boot, uptime_str = None, "---"
 
+        # CPU 名: platform.processor() は遅延なしで取れる (Windows ではレジストリ)
+        # PowerShell で Get-CimInstance を呼ぶと 3-5 秒かかるので、
+        # まずは platform.processor() の値を返し、より詳細な名前は
+        # _resolve_cpu_name_async() でバックグラウンド取得して上書きする。
         cpu_name = platform.processor() or "Unknown"
-        if platform.system() == 'Windows':
-            out, _ = run_cmd(['powershell', '-NoProfile', '-Command',
-                              '(Get-CimInstance Win32_Processor).Name'])
-            if out:
-                cpu_name = out.strip()
 
         return {
             'hostname': socket.gethostname(),
@@ -793,6 +966,32 @@ class Collector:
             'is_admin': is_admin(),
             'python': platform.python_version(),
         }
+
+    def resolve_cpu_name_full(self):
+        """より正確な CPU 名を取得 (Windows では WMI、Linux では /proc/cpuinfo)。
+        pywin32 があれば瞬時、無ければ PowerShell フォールバック。"""
+        if platform.system() == 'Windows':
+            # pywin32 を試す
+            rows = self._wmi_query('Win32_Processor', ['Name'])
+            if rows:
+                name = (rows[0].get('Name') or '').strip()
+                if name:
+                    return name
+            # フォールバック: PowerShell (遅いが互換性のため残す)
+            if rows is None:
+                out, _ = run_cmd(['powershell', '-NoProfile', '-Command',
+                                  '(Get-CimInstance Win32_Processor).Name'])
+                if out:
+                    return out.strip()
+        elif platform.system() == 'Linux':
+            try:
+                with open('/proc/cpuinfo') as f:
+                    for line in f:
+                        if line.startswith('model name'):
+                            return line.split(':', 1)[1].strip()
+            except Exception:
+                pass
+        return None
 
     def disks(self):
         out = []
@@ -911,17 +1110,29 @@ class Collector:
         except Exception:
             pass
         if platform.system() == 'Windows':
-            # WMI thermal zone
-            ps = ('(Get-WmiObject MSAcpi_ThermalZoneTemperature '
-                  '-Namespace "root/wmi" -ErrorAction SilentlyContinue '
-                  '| Select-Object -First 1).CurrentTemperature')
-            out, rc = run_cmd(['powershell', '-NoProfile', '-Command', ps],
-                              timeout=5)
-            if rc == 0 and out.strip().isdigit():
+            # WMI thermal zone (pywin32 で直接)
+            rows = self._wmi_query('MSAcpi_ThermalZoneTemperature',
+                                    ['CurrentTemperature'],
+                                    namespace='root\\wmi')
+            if rows:
                 try:
-                    return round((int(out.strip()) / 10.0) - 273.15, 1)
+                    raw = rows[0].get('CurrentTemperature')
+                    if raw:
+                        return round((int(raw) / 10.0) - 273.15, 1)
                 except Exception:
                     pass
+            elif rows is None:
+                # PowerShell フォールバック
+                ps = ('(Get-WmiObject MSAcpi_ThermalZoneTemperature '
+                      '-Namespace "root/wmi" -ErrorAction SilentlyContinue '
+                      '| Select-Object -First 1).CurrentTemperature')
+                out, rc = run_cmd(['powershell', '-NoProfile', '-Command', ps],
+                                  timeout=5)
+                if rc == 0 and out.strip().isdigit():
+                    try:
+                        return round((int(out.strip()) / 10.0) - 273.15, 1)
+                    except Exception:
+                        pass
             # OHM/LHM フォールバック
             v = self._get_ohm_sensor('Temperature', 'CPU')
             if v is not None: return v
@@ -929,6 +1140,12 @@ class Collector:
 
     def _get_gpu_usage(self):
         """GPU使用率（%）"""
+        # まず LHM HTTP から取得 (キャッシュヒットで高速)。
+        # これにより iGPU 環境での PowerShell Get-Counter (perfcounter, 約2秒) を回避。
+        # GPU usage は live() でも LHM から毎秒取っており、 LHM が主要ソース。
+        lhm = self._get_lhm_metrics()
+        if lhm and lhm.get('gpu_load') is not None:
+            return lhm.get('gpu_load')
         if not self._gpu_available:
             return None
         if self._gpu_method == 'nvidia-smi':
@@ -963,46 +1180,81 @@ class Collector:
         """全GPUのVRAM合計を取得（PnP からレジストリ経由 → AdapterRAM フォールバック）"""
         if platform.system() != 'Windows':
             return None
-        # 1. レジストリから取得（4GB超で正確）
-        ps = (r'''
-$max = 0
-Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}\*' '''
-              r'''-ErrorAction SilentlyContinue | ForEach-Object {
-    if ($_."HardwareInformation.qwMemorySize") {
-        if ($_."HardwareInformation.qwMemorySize" -gt $max) {
-            $max = $_."HardwareInformation.qwMemorySize"
-        }
-    } elseif ($_."HardwareInformation.MemorySize") {
-        $mem = $_."HardwareInformation.MemorySize"
-        if ($mem -is [byte[]]) {
-            $val = [BitConverter]::ToUInt32($mem, 0)
-            if ($val -gt $max) { $max = $val }
-        }
-    }
-}
-$max''')
-        out, rc = run_cmd(['powershell', '-NoProfile', '-Command', ps],
-                          timeout=6)
-        if rc == 0 and out.strip():
+        # 1. Python の winreg モジュールでレジストリから直接取得 (高速、PowerShell 不要)
+        try:
+            import winreg
+            key_path = (r'SYSTEM\CurrentControlSet\Control\Class'
+                        r'\{4d36e968-e325-11ce-bfc1-08002be10318}')
+            max_vram = 0
             try:
-                v = int(out.strip())
-                if v > 0: return v
-            except Exception:
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path) as base:
+                    i = 0
+                    while True:
+                        try:
+                            subkey_name = winreg.EnumKey(base, i)
+                            i += 1
+                        except OSError:
+                            break
+                        try:
+                            with winreg.OpenKey(base, subkey_name) as sub:
+                                # qwMemorySize (64bit) を優先、無ければ MemorySize
+                                try:
+                                    val, _ = winreg.QueryValueEx(sub,
+                                                    'HardwareInformation.qwMemorySize')
+                                    if val and val > max_vram:
+                                        max_vram = val
+                                    continue
+                                except FileNotFoundError:
+                                    pass
+                                try:
+                                    val, vtype = winreg.QueryValueEx(sub,
+                                                    'HardwareInformation.MemorySize')
+                                    # MemorySize はバイト配列の場合あり
+                                    if isinstance(val, bytes) and len(val) >= 4:
+                                        import struct
+                                        v = struct.unpack('<I', val[:4])[0]
+                                        if v > max_vram:
+                                            max_vram = v
+                                    elif isinstance(val, int) and val > max_vram:
+                                        max_vram = val
+                                except FileNotFoundError:
+                                    pass
+                        except OSError:
+                            continue
+            except OSError:
                 pass
+            if max_vram > 0:
+                return max_vram
+        except Exception:
+            pass
 
-        # 2. WMI AdapterRAM フォールバック（4GB超でオーバーフロー）
-        ps2 = ('(Get-CimInstance Win32_VideoController | '
-               'Sort-Object AdapterRAM -Descending | '
-               'Select-Object -First 1).AdapterRAM')
-        out, rc = run_cmd(['powershell', '-NoProfile', '-Command', ps2],
-                          timeout=4)
-        if rc == 0 and out.strip():
-            try:
-                ram = int(out.strip())
-                if ram < 0: ram = (1 << 32) + ram
-                return ram if ram > 0 else None
-            except Exception:
-                pass
+        # 2. pywin32 で AdapterRAM (4GB超でオーバーフロー)
+        rows = self._wmi_query('Win32_VideoController', ['AdapterRAM'])
+        if rows:
+            max_ram = 0
+            for r in rows:
+                ram = r.get('AdapterRAM') or 0
+                try: ram = int(ram)
+                except (ValueError, TypeError): ram = 0
+                if ram < 0:
+                    ram = (1 << 32) + ram
+                if ram > max_ram:
+                    max_ram = ram
+            return max_ram if max_ram > 0 else None
+        elif rows is None:
+            # PowerShell フォールバック
+            ps2 = ('(Get-CimInstance Win32_VideoController | '
+                   'Sort-Object AdapterRAM -Descending | '
+                   'Select-Object -First 1).AdapterRAM')
+            out, rc = run_cmd(['powershell', '-NoProfile', '-Command', ps2],
+                              timeout=4)
+            if rc == 0 and out.strip():
+                try:
+                    ram = int(out.strip())
+                    if ram < 0: ram = (1 << 32) + ram
+                    return ram if ram > 0 else None
+                except Exception:
+                    pass
         return None
 
     def _get_gpu_perfcounter_extras(self):
@@ -1035,7 +1287,12 @@ $res | ConvertTo-Json -Compress
             return None
 
     def _get_gpu_extras(self):
-        """nvidia-smiで温度・電力・FAN・クロック・VRAM使用量を一発取得"""
+        """nvidia-smi/LHM/PerfCounter で GPU 詳細を一発取得。
+        優先順位:
+          1. nvidia-smi (NVIDIA GPU 専用、 一番リッチ)
+          2. LHM (HTTP 経由、 ノート PC iGPU でも対応、 高速)
+          3. PerfCounter (Get-Counter、 PowerShell が遅いので最後の手段)
+        """
         result = None
         if self._gpu_method == 'nvidia-smi' and self._gpu_cmd:
             out, rc = run_cmd([self._gpu_cmd,
@@ -1065,17 +1322,24 @@ $res | ConvertTo-Json -Compress
                         'vram_total_mb': f(parts[7]),
                     }
 
-        # PerfCounter で補完（NVIDIA以外でも VRAM/temp が取れる）
-        pc = self._get_gpu_perfcounter_extras()
-        if pc:
-            if result is None:
-                result = {}
-            if not result.get('vram_used_mb') and pc.get('vram_used_bytes'):
-                result['vram_used_mb'] = pc['vram_used_bytes'] / (1024 * 1024)
-                if self._vram_total_bytes:
-                    result['vram_total_mb'] = self._vram_total_bytes / (1024 * 1024)
-            if not result.get('temp') and pc.get('temp'):
-                result['temp'] = pc['temp']
+        # LHM から取れる情報で十分なら、 重い PerfCounter (Get-Counter, 8秒) は
+        # 呼ばない。 これにより 起動時間が大幅に短縮される。
+        # LHM のセンサー (HTTP) を確認 (これは高速、 キャッシュもある)
+        lhm_sensors = self._get_lhm_http_sensors()
+
+        # PerfCounter フォールバック (LHM もなく、 NVIDIA でもないシステム用)
+        # LHM が動いていれば PerfCounter (8秒) はスキップ
+        if not lhm_sensors:
+            pc = self._get_gpu_perfcounter_extras()
+            if pc:
+                if result is None:
+                    result = {}
+                if not result.get('vram_used_mb') and pc.get('vram_used_bytes'):
+                    result['vram_used_mb'] = pc['vram_used_bytes'] / (1024 * 1024)
+                    if self._vram_total_bytes:
+                        result['vram_total_mb'] = self._vram_total_bytes / (1024 * 1024)
+                if not result.get('temp') and pc.get('temp'):
+                    result['temp'] = pc['temp']
 
         # OHM/LHM フォールバック（GPU 温度・電力・FAN・クロック）
         lhm = self._get_lhm_metrics()
@@ -1094,6 +1358,12 @@ $res | ConvertTo-Json -Compress
             if not result.get('vram_used_mb') and lhm.get('vram_used_mb'):
                 result['vram_used_mb'] = lhm['vram_used_mb']
                 result['vram_total_mb'] = lhm.get('vram_total_mb')
+            # VRAM total フォールバック: LHM が used だけ返した場合 (D3D 統計など) に
+            # Win32 AdapterRAM (winreg 経由) で total を補完
+            if (result.get('vram_used_mb') is not None
+                    and not result.get('vram_total_mb')
+                    and self._vram_total_bytes):
+                result['vram_total_mb'] = self._vram_total_bytes / (1024 * 1024)
             # GPU が iGPU の場合のフラグ
             if lhm.get('gpu_is_integrated'):
                 result['is_integrated'] = True
@@ -1110,7 +1380,13 @@ $res | ConvertTo-Json -Compress
         """smartctlで代表SSD1台分の温度・wear・累計書込・spare取得
         smartctl が使えなければ LHM データから取得"""
         result = None
-        smartctl = self._check_smartctl()
+        # 起動高速化: 初回 extras() 呼び出しでは smartctl をスキップ
+        # (smartctl は外部 .exe で 0.5-1.5 秒食い、 ALL COMPLETE のボトルネックとなる)
+        # 2 回目以降の _tick_heavy (起動 5 秒後) で smartctl を取得
+        skip_smartctl = self._extras_initial
+        if self._extras_initial:
+            self._extras_initial = False
+        smartctl = None if skip_smartctl else self._check_smartctl()
         if smartctl:
             smart_map = self._get_smart_data(smartctl)
             if smart_map:
@@ -1148,17 +1424,34 @@ $res | ConvertTo-Json -Compress
         """CPU電圧（V）を取得"""
         if platform.system() != 'Windows':
             return None
-        # 1. WMI Win32_Processor.CurrentVoltage
-        ps = ('$cv = (Get-CimInstance Win32_Processor).CurrentVoltage; '
-              'if ($cv -band 0x80) { ($cv -band 0x7F) / 10.0 } else { -1 }')
-        out, rc = run_cmd(['powershell', '-NoProfile', '-Command', ps],
-                          timeout=4)
-        if rc == 0 and out.strip():
+        # まず LHM HTTP から取得 (キャッシュヒットで高速)。
+        # これにより WMI CurrentVoltage 無効時の OHM WMI Provider / PowerShell
+        # フォールバック (約1.5秒) を回避。 Vcore は LHM が主要ソース。
+        lhm = self._get_lhm_metrics()
+        if lhm and lhm.get('cpu_voltage') is not None:
+            return lhm.get('cpu_voltage')
+        # 1. pywin32 で Win32_Processor.CurrentVoltage を直接取得
+        rows = self._wmi_query('Win32_Processor', ['CurrentVoltage'])
+        if rows:
             try:
-                v = float(out.strip())
-                if v > 0: return v
+                cv = rows[0].get('CurrentVoltage')
+                if cv and (cv & 0x80):
+                    v = (cv & 0x7F) / 10.0
+                    if v > 0: return v
             except Exception:
                 pass
+        elif rows is None:
+            # フォールバック: PowerShell
+            ps = ('$cv = (Get-CimInstance Win32_Processor).CurrentVoltage; '
+                  'if ($cv -band 0x80) { ($cv -band 0x7F) / 10.0 } else { -1 }')
+            out, rc = run_cmd(['powershell', '-NoProfile', '-Command', ps],
+                              timeout=4)
+            if rc == 0 and out.strip():
+                try:
+                    v = float(out.strip())
+                    if v > 0: return v
+                except Exception:
+                    pass
         # 2. OpenHardwareMonitor / LibreHardwareMonitor の WMI Provider
         v = self._get_ohm_sensor('Voltage', 'CPU')
         if v is not None: return v
@@ -1215,28 +1508,54 @@ $res | ConvertTo-Json -Compress
             lambda s: ('/intelcpu/' in s['id'] or '/amdcpu/' in s['id'])
             and '/power/' in s['id'] and 'cpu package' in s['text'].lower())
 
-        # 各コアの電圧/クロック/温度（CPU Core #1〜）
+        # 各コアの電圧/クロック/温度 (CPU Core #1〜)
+        # LHM のテキスト名はベンダ・モデルによって異なる:
+        #   Intel: 'CPU Core #1', 'CPU Core #1 VID' (前置詞あり)
+        #   AMD: 'Core #1', 'Core #1 VID' (前置詞なし)
+        #   AMD 温度: 個別コア温度はなく、'Core (Tctl/Tdie)' 1 つだけ
+        # → 両方のパターンを許容する
+        def _match_core(s, kind, idx):
+            tl = s['text'].lower()
+            sid = s['id']
+            if '/intelcpu/' not in sid and '/amdcpu/' not in sid:
+                return False
+            if f'/{kind}/' not in sid:
+                return False
+            # 完全一致 (Intel)
+            if tl == f'cpu core #{idx}':
+                return True
+            # AMD: 'Core #1', 'Core #1 VID', 'Core #1 (Effective)' など
+            if tl == f'core #{idx}':
+                return True
+            if tl == f'core #{idx} vid':  # 電圧用
+                return True
+            return False
+
         core_voltages = []
         core_clocks = []
         core_temps = []
         for i in range(1, 33):  # 最大32コアまで
-            v = find_first(
-                lambda s, idx=i: ('/intelcpu/' in s['id'] or '/amdcpu/' in s['id'])
-                and '/voltage/' in s['id']
-                and s['text'].lower() == f'cpu core #{idx}')
-            c = find_first(
-                lambda s, idx=i: ('/intelcpu/' in s['id'] or '/amdcpu/' in s['id'])
-                and '/clock/' in s['id']
-                and s['text'].lower() == f'cpu core #{idx}')
-            t = find_first(
-                lambda s, idx=i: ('/intelcpu/' in s['id'] or '/amdcpu/' in s['id'])
-                and '/temperature/' in s['id']
-                and s['text'].lower() == f'cpu core #{idx}')
+            v = find_first(lambda s, idx=i: _match_core(s, 'voltage', idx))
+            c = find_first(lambda s, idx=i: _match_core(s, 'clock', idx))
+            t = find_first(lambda s, idx=i: _match_core(s, 'temperature', idx))
             if v is None and c is None and t is None:
                 break
             core_voltages.append(v)
             core_clocks.append(c)
             core_temps.append(t)
+
+        # AMD で個別コア温度が無い場合、'Core (Tctl/Tdie)' を全コアに適用
+        if core_clocks and all(t is None for t in core_temps):
+            cpu_temp_overall = find_first(
+                lambda s: '/amdcpu/' in s['id'] and '/temperature/' in s['id']
+                and ('tctl' in s['text'].lower() or 'tdie' in s['text'].lower()))
+            if cpu_temp_overall is None:
+                cpu_temp_overall = find_first(
+                    lambda s: '/amdcpu/' in s['id'] and '/temperature/' in s['id']
+                    and 'core' in s['text'].lower())
+            if cpu_temp_overall is not None:
+                core_temps = [cpu_temp_overall] * len(core_clocks)
+
         m['core_voltages'] = core_voltages
         m['core_clocks'] = core_clocks
         m['core_temps'] = core_temps
@@ -1290,7 +1609,13 @@ $res | ConvertTo-Json -Compress
         m['gpu_detected'] = any(is_gpu(s) for s in sensors)
         m['gpu_is_integrated'] = any('integrated' in s['id'].lower() for s in sensors)
 
-        # ── VRAM (Intel iGPUの場合は /vram/、専用GPUは GPU側) ──
+        # ── VRAM (LHM が公開するパターンは GPU ベンダーごとに異なる) ──
+        # A) Intel iGPU                : /vram/...   'Memory Used'/'Memory Available'   GB
+        # B) NVIDIA / AMD 専用GPU       : /gpu-.../   'GPU Memory Used/Total/Free'        MB
+        # C) AMD iGPU (Ryzen 内蔵 Radeon): /gpu-amd-integrated/ 'GPU Memory Used' 等       MB
+        # D) D3D 統計 (Win10/11)        : /gpu-.../   'D3D Dedicated Memory Used'         MB
+        # 取れたら速攻 return しないで、 上から優先順に試す
+        # A) Intel iGPU
         vram_used_gb = find_first(
             lambda s: '/vram/' in s['id'] and 'memory used' == s['text'].lower())
         vram_avail_gb = find_first(
@@ -1298,6 +1623,31 @@ $res | ConvertTo-Json -Compress
         if vram_used_gb is not None and vram_avail_gb is not None:
             m['vram_used_mb'] = vram_used_gb * 1024
             m['vram_total_mb'] = (vram_used_gb + vram_avail_gb) * 1024
+
+        # B/C) 専用 GPU / AMD iGPU の "GPU Memory Used / Total / Free" (MB)
+        if m.get('vram_used_mb') is None:
+            def _gpu_data(name_lower):
+                return find_first(
+                    lambda s: is_gpu(s) and s['text'].lower() == name_lower)
+            vu_mb = _gpu_data('gpu memory used') or _gpu_data('memory used')
+            vt_mb = _gpu_data('gpu memory total') or _gpu_data('memory total')
+            vf_mb = _gpu_data('gpu memory free') or _gpu_data('memory free')
+            if vu_mb is not None:
+                m['vram_used_mb'] = vu_mb
+                if vt_mb is not None:
+                    m['vram_total_mb'] = vt_mb
+                elif vf_mb is not None:
+                    m['vram_total_mb'] = vu_mb + vf_mb
+
+        # D) D3D Dedicated Memory Used (Win10/11、 LHM 0.9+ で公開)
+        if m.get('vram_used_mb') is None:
+            d3d_used = find_first(
+                lambda s: is_gpu(s)
+                and 'd3d' in s['text'].lower()
+                and 'dedicated memory used' in s['text'].lower())
+            if d3d_used is not None:
+                m['vram_used_mb'] = d3d_used
+                # total は _get_gpu_extras 側で Win32 AdapterRAM から補完
 
         # ── NVMe SSD ──
         m['ssd_temp'] = find_first(
@@ -1416,16 +1766,35 @@ $res | ConvertTo-Json -Compress
 
     def _get_lhm_http_sensors(self):
         """LHM の HTTP Web Server (port 8085) から全センサーを取得
-        1秒キャッシュ (旧 5秒): GPU グラフ等を毎秒更新するために短縮"""
+        - 成功時: 1秒キャッシュ (GPU グラフ等を毎秒更新するため)
+        - 失敗時: 5秒キャッシュ (LHM 未起動時に毎秒 2 秒待たないため)
+        - タイムアウト: 0.5 秒 (旧 2 秒、起動を速くするため短縮)
+        """
         now = time.time()
         if hasattr(self, '_lhm_http_cache'):
             cached, t = self._lhm_http_cache
-            if now - t < 1:
+            # 成功キャッシュは 1 秒、失敗キャッシュは 5 秒
+            ttl = 1 if cached is not None else 5
+            if now - t < ttl:
                 return cached
+        # lock 取得中に他スレッドが取得を終えているかもしれないので、
+        # lock 内で再度キャッシュをチェック (double-check)。 これにより
+        # 複数タスクが同時に来ても実 HTTP リクエストは 1 回だけになる。
+        with self._lhm_http_lock:
+            if hasattr(self, '_lhm_http_cache'):
+                cached, t = self._lhm_http_cache
+                ttl = 1 if cached is not None else 5
+                if time.time() - t < ttl:
+                    return cached
+            return self._fetch_lhm_http_sensors_locked()
+
+    def _fetch_lhm_http_sensors_locked(self):
+        """実際の LHM HTTP 取得 (lock 保持中に呼ばれる)。 結果をキャッシュに保存。"""
+        now = time.time()
         try:
             import urllib.request
             with urllib.request.urlopen('http://localhost:8085/data.json',
-                                         timeout=2) as r:
+                                         timeout=0.5) as r:
                 data = json.loads(r.read().decode('utf-8'))
         except Exception:
             self._lhm_http_cache = (None, now)
@@ -1458,15 +1827,21 @@ $res | ConvertTo-Json -Compress
         sensors = self._get_lhm_http_sensors()
         if sensors:
             return True, 'LHM (HTTP:8085)'
-        # WMI Provider を試す
-        for ns, name in (('root/LibreHardwareMonitor', 'LibreHardwareMonitor'),
-                          ('root/OpenHardwareMonitor', 'OpenHardwareMonitor')):
-            ps = (f'(Get-CimInstance -Namespace "{ns}" -ClassName Sensor '
-                  f'-ErrorAction SilentlyContinue | Measure-Object).Count')
-            out, rc = run_cmd(['powershell', '-NoProfile', '-Command', ps],
-                              timeout=4)
-            if rc == 0 and out.strip().isdigit() and int(out.strip()) > 0:
+        # WMI Provider を試す (pywin32 で直接)
+        for ns, name in (('root\\LibreHardwareMonitor', 'LibreHardwareMonitor'),
+                          ('root\\OpenHardwareMonitor', 'OpenHardwareMonitor')):
+            rows = self._wmi_query('Sensor', ['Name'], namespace=ns)
+            if rows and len(rows) > 0:
                 return True, f'{name} (WMI)'
+            elif rows is None:
+                # フォールバック: PowerShell
+                ns_ps = ns.replace('\\', '/')
+                ps = (f'(Get-CimInstance -Namespace "{ns_ps}" -ClassName Sensor '
+                      f'-ErrorAction SilentlyContinue | Measure-Object).Count')
+                out, rc = run_cmd(['powershell', '-NoProfile', '-Command', ps],
+                                  timeout=4)
+                if rc == 0 and out.strip().isdigit() and int(out.strip()) > 0:
+                    return True, f'{name} (WMI)'
         return False, None
 
     def extras(self):
@@ -1590,94 +1965,119 @@ $res | ConvertTo-Json -Compress
         now = time.time()
         if not force and self._details['data'] and (now - self._details['t']) < DETAILS_CACHE_S:
             return self._details['data']
-        # 4つのサブクエリを並列実行
-        results = {}
-        def _run(key, fn):
-            try:
-                results[key] = fn()
-            except Exception as e:
-                print(f"[details:{key}] {e}")
-                results[key] = None
-        threads = [
-            threading.Thread(target=_run, args=('cpu', self._cpu_detail), daemon=True),
-            threading.Thread(target=_run, args=('dimms', self._dimms), daemon=True),
-            threading.Thread(target=_run, args=('pdisks', self._pdisks), daemon=True),
-            threading.Thread(target=_run, args=('gpus', self._gpu_details), daemon=True),
-        ]
-        for t in threads: t.start()
-        for t in threads: t.join()
-        data = {
-            'cpu': results.get('cpu') or {},
-            'dimms': results.get('dimms') or {},
-            'pdisks': results.get('pdisks') or [],
-            'gpus': results.get('gpus') or [],
-        }
-        self._details = {'data': data, 't': now}
-        return data
+        # 並列で複数スレッドから呼ばれた場合 (起動時の task_details と
+        # task_heavy 内の pdisks 取得など)、 lock 取得後にもう一度キャッシュをチェックして
+        # 1 回だけ実行する (double-checked locking)
+        with self._details_lock:
+            now = time.time()
+            if not force and self._details['data'] and (now - self._details['t']) < DETAILS_CACHE_S:
+                return self._details['data']
+            # 4つのサブクエリを並列実行
+            results = {}
+            def _run(key, fn):
+                try:
+                    results[key] = fn()
+                except Exception as e:
+                    print(f"[details:{key}] {e}")
+                    results[key] = None
+            threads = [
+                threading.Thread(target=_run, args=('cpu', self._cpu_detail), daemon=True),
+                threading.Thread(target=_run, args=('dimms', self._dimms), daemon=True),
+                threading.Thread(target=_run, args=('pdisks', self._pdisks), daemon=True),
+                threading.Thread(target=_run, args=('gpus', self._gpu_details), daemon=True),
+            ]
+            for t in threads: t.start()
+            for t in threads: t.join()
+            data = {
+                'cpu': results.get('cpu') or {},
+                'dimms': results.get('dimms') or {},
+                'pdisks': results.get('pdisks') or [],
+                'gpus': results.get('gpus') or [],
+            }
+            self._details = {'data': data, 't': now}
+            return data
 
     def _gpu_details(self):
         """全GPU情報を取得"""
         if platform.system() != 'Windows':
             return []
         result = []
-        # Win32_VideoController で全GPU列挙
-        ps = ('Get-CimInstance Win32_VideoController | Select-Object '
-              'Name,AdapterCompatibility,AdapterRAM,DriverVersion,DriverDate,'
-              'VideoProcessor,VideoMemoryType,VideoModeDescription,'
-              'CurrentHorizontalResolution,CurrentVerticalResolution,'
-              'CurrentRefreshRate,CurrentBitsPerPixel,Status,PNPDeviceID '
-              '| ConvertTo-Json')
-        out, rc = run_cmd(['powershell', '-NoProfile', '-Command', ps],
-                          timeout=10)
-        if rc == 0 and out:
-            try:
-                data = json.loads(out)
-                if not isinstance(data, list): data = [data]
-                for g in data:
-                    name = (g.get('Name') or '').strip()
-                    if not name: continue
-                    ram = g.get('AdapterRAM') or 0
-                    # 古いWMIは4GB超で int32 オーバーフロー
-                    if ram < 0:
-                        ram = (1 << 32) + ram
-                    dd = g.get('DriverDate', '')
-                    # WMI 日付の各種フォーマットを ISO に正規化
-                    if dd and isinstance(dd, str):
-                        import re as _re
-                        # ASP.NET JSON 形式: /Date(1658...)/ (ms タイムスタンプ)
-                        m_aspnet = _re.search(r'/Date\((-?\d+)', dd)
-                        # CIM 形式: 20240515000000.000000+540
-                        m_cim = _re.search(r'^(\d{14})', dd)
-                        if m_aspnet:
-                            try:
-                                from datetime import datetime, timezone
-                                ms = int(m_aspnet.group(1))
-                                dd = datetime.fromtimestamp(
-                                    ms / 1000, tz=timezone.utc
-                                ).strftime('%Y-%m-%d')
-                            except Exception:
-                                pass
-                        elif m_cim:
-                            d = m_cim.group(1)
-                            dd = f"{d[:4]}-{d[4:6]}-{d[6:8]}"
-                    result.append({
-                        'name': name,
-                        'vendor': (g.get('AdapterCompatibility') or '').strip(),
-                        'vram_bytes': ram if ram > 0 else None,
-                        'driver_version': (g.get('DriverVersion') or '').strip(),
-                        'driver_date': dd,
-                        'processor': (g.get('VideoProcessor') or '').strip(),
-                        'resolution': f"{g.get('CurrentHorizontalResolution')}x"
-                                      f"{g.get('CurrentVerticalResolution')}"
-                                      if g.get('CurrentHorizontalResolution') else None,
-                        'refresh_hz': g.get('CurrentRefreshRate'),
-                        'bpp': g.get('CurrentBitsPerPixel'),
-                        'status': (g.get('Status') or '').strip(),
-                    })
-            except Exception:
-                pass
+        import re as _re
 
-        # NVIDIA詳細を nvidia-smi で
+        def _parse_driver_date(dd):
+            if not dd or not isinstance(dd, str):
+                return dd
+            m_aspnet = _re.search(r'/Date\((-?\d+)', dd)
+            m_cim = _re.search(r'^(\d{14})', dd)
+            if m_aspnet:
+                try:
+                    from datetime import datetime, timezone
+                    ms = int(m_aspnet.group(1))
+                    return datetime.fromtimestamp(
+                        ms / 1000, tz=timezone.utc
+                    ).strftime('%Y-%m-%d')
+                except Exception:
+                    pass
+            elif m_cim:
+                d = m_cim.group(1)
+                return f"{d[:4]}-{d[4:6]}-{d[6:8]}"
+            return dd
+
+        def _process_row(g):
+            name = (g.get('Name') or '').strip()
+            if not name:
+                return None
+            ram = g.get('AdapterRAM') or 0
+            try: ram = int(ram)
+            except (ValueError, TypeError): ram = 0
+            if ram < 0:
+                ram = (1 << 32) + ram
+            return {
+                'name': name,
+                'vendor': (g.get('AdapterCompatibility') or '').strip(),
+                'vram_bytes': ram if ram > 0 else None,
+                'driver_version': (g.get('DriverVersion') or '').strip(),
+                'driver_date': _parse_driver_date(g.get('DriverDate', '')),
+                'processor': (g.get('VideoProcessor') or '').strip(),
+                'resolution': (f"{g.get('CurrentHorizontalResolution')}x"
+                               f"{g.get('CurrentVerticalResolution')}"
+                               if g.get('CurrentHorizontalResolution') else None),
+                'refresh_hz': g.get('CurrentRefreshRate'),
+                'bpp': g.get('CurrentBitsPerPixel'),
+                'status': (g.get('Status') or '').strip(),
+            }
+
+        # ── Win32_VideoController: pywin32 で直接 ──
+        rows = self._wmi_query('Win32_VideoController', [
+            'Name', 'AdapterCompatibility', 'AdapterRAM', 'DriverVersion',
+            'DriverDate', 'VideoProcessor', 'CurrentHorizontalResolution',
+            'CurrentVerticalResolution', 'CurrentRefreshRate',
+            'CurrentBitsPerPixel', 'Status'])
+        if rows is not None:
+            for g in rows:
+                rec = _process_row(g)
+                if rec: result.append(rec)
+        else:
+            # PowerShell フォールバック
+            ps = ('Get-CimInstance Win32_VideoController | Select-Object '
+                  'Name,AdapterCompatibility,AdapterRAM,DriverVersion,DriverDate,'
+                  'VideoProcessor,VideoMemoryType,VideoModeDescription,'
+                  'CurrentHorizontalResolution,CurrentVerticalResolution,'
+                  'CurrentRefreshRate,CurrentBitsPerPixel,Status,PNPDeviceID '
+                  '| ConvertTo-Json')
+            out, rc = run_cmd(['powershell', '-NoProfile', '-Command', ps],
+                              timeout=10)
+            if rc == 0 and out:
+                try:
+                    data = json.loads(out)
+                    if not isinstance(data, list): data = [data]
+                    for g in data:
+                        rec = _process_row(g)
+                        if rec: result.append(rec)
+                except Exception:
+                    pass
+
+        # NVIDIA詳細を nvidia-smi で (これはサブプロセス、WMI 化不可)
         if self._gpu_method == 'nvidia-smi' and self._gpu_cmd:
             out, rc = run_cmd([self._gpu_cmd,
                 '--query-gpu=name,serial,uuid,driver_version,'
@@ -1711,7 +2111,6 @@ $res | ConvertTo-Json -Compress
                         'clock_gpu_max': parts[16],
                         'clock_mem_max': parts[17],
                     }
-                    # 既存のresultにマージ
                     if i < len(result):
                         result[i]['nvidia'] = nv
                     else:
@@ -1736,81 +2135,125 @@ $res | ConvertTo-Json -Compress
             'voltage_v': None,
         }
         if platform.system() == 'Windows':
-            ps = ('Get-CimInstance Win32_Processor | Select-Object '
-                  'Name,Manufacturer,ProcessorId,Architecture,AddressWidth,'
-                  'MaxClockSpeed,CurrentClockSpeed,L2CacheSize,L3CacheSize,'
-                  'SocketDesignation,VirtualizationFirmwareEnabled,'
-                  'Family,Stepping,Description,Revision,'
-                  'NumberOfCores,NumberOfLogicalProcessors,'
-                  'CurrentVoltage,SecondLevelAddressTranslationExtensions,'
-                  'VMMonitorModeExtensions | ConvertTo-Json')
-            out, rc = run_cmd(['powershell', '-NoProfile', '-Command', ps])
-            if rc == 0 and out:
-                try:
-                    d = json.loads(out)
-                    if isinstance(d, list): d = d[0]
-                    info['name'] = (d.get('Name') or '').strip() or info['name']
-                    info['manufacturer'] = (d.get('Manufacturer') or '').strip()
-                    info['processor_id'] = (d.get('ProcessorId') or '').strip()
-                    arch_map = {0: 'x86', 5: 'ARM', 6: 'IA64', 9: 'x64', 12: 'ARM64'}
-                    info['architecture'] = arch_map.get(d.get('Architecture'),
-                                                        info['architecture'])
-                    info['address_width'] = d.get('AddressWidth')
-                    info['max_clock_mhz'] = d.get('MaxClockSpeed')
-                    info['current_clock_mhz'] = d.get('CurrentClockSpeed')
-                    info['l2_kb'] = d.get('L2CacheSize')
-                    info['l3_kb'] = d.get('L3CacheSize')
-                    info['socket'] = (d.get('SocketDesignation') or '').strip()
-                    info['virtualization'] = d.get('VirtualizationFirmwareEnabled')
-                    info['family'] = d.get('Family')
-                    info['stepping'] = d.get('Stepping')
-                    info['description'] = (d.get('Description') or '').strip()
-                    info['cores_phys'] = d.get('NumberOfCores')
-                    info['cores_log'] = d.get('NumberOfLogicalProcessors')
-                    if info['cores_phys'] and info['cores_log']:
-                        info['hyperthreading'] = info['cores_log'] > info['cores_phys']
-                    cv = d.get('CurrentVoltage')
-                    if cv:
-                        # WMI仕様: 下位7bit / 10 が現在電圧（V）
-                        info['voltage_v'] = (cv & 0x7F) / 10.0 if cv & 0x80 else None
-                    # Description から family/model/stepping を補完
-                    # 例: "Intel64 Family 6 Model 158 Stepping 13"
-                    desc = info['description'] or ''
-                    import re as _re
-                    m_match = _re.search(r'Model\s+(\d+)', desc)
-                    if m_match:
-                        info['model'] = int(m_match.group(1))
-                except Exception:
-                    pass
+            # ── Win32_Processor: pywin32 で直接 (PowerShell より 1-2 秒速い) ──
+            rows = self._wmi_query('Win32_Processor', [
+                'Name', 'Manufacturer', 'ProcessorId', 'Architecture',
+                'AddressWidth', 'MaxClockSpeed', 'CurrentClockSpeed',
+                'L2CacheSize', 'L3CacheSize', 'SocketDesignation',
+                'VirtualizationFirmwareEnabled', 'Family', 'Stepping',
+                'Description', 'NumberOfCores', 'NumberOfLogicalProcessors',
+                'CurrentVoltage'])
+            if rows:
+                d = rows[0]
+                info['name'] = (d.get('Name') or '').strip() or info['name']
+                info['manufacturer'] = (d.get('Manufacturer') or '').strip()
+                info['processor_id'] = (d.get('ProcessorId') or '').strip()
+                arch_map = {0: 'x86', 5: 'ARM', 6: 'IA64', 9: 'x64', 12: 'ARM64'}
+                info['architecture'] = arch_map.get(d.get('Architecture'),
+                                                     info['architecture'])
+                info['address_width'] = d.get('AddressWidth')
+                info['max_clock_mhz'] = d.get('MaxClockSpeed')
+                info['current_clock_mhz'] = d.get('CurrentClockSpeed')
+                info['l2_kb'] = d.get('L2CacheSize')
+                info['l3_kb'] = d.get('L3CacheSize')
+                info['socket'] = (d.get('SocketDesignation') or '').strip()
+                info['virtualization'] = d.get('VirtualizationFirmwareEnabled')
+                info['family'] = d.get('Family')
+                info['stepping'] = d.get('Stepping')
+                info['description'] = (d.get('Description') or '').strip()
+                info['cores_phys'] = d.get('NumberOfCores')
+                info['cores_log'] = d.get('NumberOfLogicalProcessors')
+                if info['cores_phys'] and info['cores_log']:
+                    info['hyperthreading'] = info['cores_log'] > info['cores_phys']
+                cv = d.get('CurrentVoltage')
+                if cv:
+                    info['voltage_v'] = (cv & 0x7F) / 10.0 if cv & 0x80 else None
+                desc = info['description'] or ''
+                import re as _re
+                m_match = _re.search(r'Model\s+(\d+)', desc)
+                if m_match:
+                    info['model'] = int(m_match.group(1))
+            elif rows is None:
+                # pywin32 が使えない、または失敗 → PowerShell フォールバック
+                ps = ('Get-CimInstance Win32_Processor | Select-Object '
+                      'Name,Manufacturer,ProcessorId,Architecture,AddressWidth,'
+                      'MaxClockSpeed,CurrentClockSpeed,L2CacheSize,L3CacheSize,'
+                      'SocketDesignation,VirtualizationFirmwareEnabled,'
+                      'Family,Stepping,Description,Revision,'
+                      'NumberOfCores,NumberOfLogicalProcessors,'
+                      'CurrentVoltage | ConvertTo-Json')
+                out, rc = run_cmd(['powershell', '-NoProfile', '-Command', ps])
+                if rc == 0 and out:
+                    try:
+                        d = json.loads(out)
+                        if isinstance(d, list): d = d[0]
+                        info['name'] = (d.get('Name') or '').strip() or info['name']
+                        info['manufacturer'] = (d.get('Manufacturer') or '').strip()
+                        info['processor_id'] = (d.get('ProcessorId') or '').strip()
+                        arch_map = {0: 'x86', 5: 'ARM', 6: 'IA64', 9: 'x64', 12: 'ARM64'}
+                        info['architecture'] = arch_map.get(d.get('Architecture'),
+                                                            info['architecture'])
+                        info['address_width'] = d.get('AddressWidth')
+                        info['max_clock_mhz'] = d.get('MaxClockSpeed')
+                        info['current_clock_mhz'] = d.get('CurrentClockSpeed')
+                        info['l2_kb'] = d.get('L2CacheSize')
+                        info['l3_kb'] = d.get('L3CacheSize')
+                        info['socket'] = (d.get('SocketDesignation') or '').strip()
+                        info['virtualization'] = d.get('VirtualizationFirmwareEnabled')
+                        info['family'] = d.get('Family')
+                        info['stepping'] = d.get('Stepping')
+                        info['description'] = (d.get('Description') or '').strip()
+                        info['cores_phys'] = d.get('NumberOfCores')
+                        info['cores_log'] = d.get('NumberOfLogicalProcessors')
+                        if info['cores_phys'] and info['cores_log']:
+                            info['hyperthreading'] = info['cores_log'] > info['cores_phys']
+                        cv = d.get('CurrentVoltage')
+                        if cv:
+                            info['voltage_v'] = (cv & 0x7F) / 10.0 if cv & 0x80 else None
+                        desc = info['description'] or ''
+                        import re as _re
+                        m_match = _re.search(r'Model\s+(\d+)', desc)
+                        if m_match:
+                            info['model'] = int(m_match.group(1))
+                    except Exception:
+                        pass
 
-            # L1 キャッシュ
-            ps = ('(Get-CimInstance Win32_CacheMemory | Where-Object '
-                  '{$_.Purpose -like "*L1*"} | Measure-Object InstalledSize -Sum).Sum')
-            out, rc = run_cmd(['powershell', '-NoProfile', '-Command', ps], timeout=8)
-            if rc == 0 and out.strip().isdigit():
-                info['l1_kb'] = int(out.strip())
+            # L1 キャッシュ (Win32_CacheMemory)
+            l1_rows = self._wmi_query('Win32_CacheMemory',
+                                       ['Purpose', 'InstalledSize'])
+            if l1_rows is not None:
+                total_l1 = 0
+                for r in l1_rows:
+                    purpose = (r.get('Purpose') or '')
+                    if 'L1' in str(purpose):
+                        sz = r.get('InstalledSize') or 0
+                        total_l1 += sz
+                if total_l1 > 0:
+                    info['l1_kb'] = total_l1
+            else:
+                # PowerShell フォールバック
+                ps = ('(Get-CimInstance Win32_CacheMemory | Where-Object '
+                      '{$_.Purpose -like "*L1*"} | Measure-Object InstalledSize -Sum).Sum')
+                out, rc = run_cmd(['powershell', '-NoProfile', '-Command', ps], timeout=8)
+                if rc == 0 and out.strip().isdigit():
+                    info['l1_kb'] = int(out.strip())
 
             # マイクロコードバージョン（レジストリ）
-            out, rc = run_cmd(['reg', 'query',
-                r'HKLM\HARDWARE\DESCRIPTION\System\CentralProcessor\0',
-                '/v', 'Update Revision'])
-            if rc == 0 and out:
-                # 出力: "    Update Revision    REG_BINARY    0000000000F4000000000000"
-                for line in out.splitlines():
-                    if 'Update Revision' in line and 'REG_BINARY' in line:
-                        parts = line.split()
-                        if parts:
-                            hex_val = parts[-1]
-                            # 上位4バイトに本体（リトルエンディアン）
-                            if len(hex_val) >= 8:
-                                try:
-                                    # 例: 0000000000F40000 → 上位の F400 を抽出
-                                    rev = hex_val[8:16] if len(hex_val) >= 16 else hex_val
-                                    # リバース取得
-                                    info['microcode'] = '0x' + rev.lstrip('0')[:8].upper() or '0x0'
-                                except Exception:
-                                    pass
-                        break
+            # winreg で直接読む (reg query 外部プロセス起動を回避して高速化)。
+            # reg query はプロセス起動コストで 0.3-0.5 秒かかり cpu_detail の律速だった。
+            try:
+                import winreg
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                        r'HARDWARE\DESCRIPTION\System\CentralProcessor\0') as _ck:
+                    _val, _ = winreg.QueryValueEx(_ck, 'Update Revision')
+                if isinstance(_val, bytes):
+                    hex_val = _val.hex().upper()
+                    # 旧 reg query 解析と同じロジック: 上位4バイト側を抽出
+                    if len(hex_val) >= 8:
+                        rev = hex_val[8:16] if len(hex_val) >= 16 else hex_val
+                        info['microcode'] = '0x' + (rev.lstrip('0')[:8] or '0')
+            except Exception:
+                pass
 
             # CPU 命令セット (IsProcessorFeaturePresent)
             try:
@@ -1851,72 +2294,127 @@ $res | ConvertTo-Json -Compress
     def _dimms(self):
         if platform.system() != 'Windows':
             return {'modules': [], 'array': {}}
-        ps = ('Get-CimInstance Win32_PhysicalMemory | Select-Object '
-              'DeviceLocator,BankLabel,Capacity,Speed,ConfiguredClockSpeed,'
-              'Manufacturer,PartNumber,SerialNumber,FormFactor,SMBIOSMemoryType,'
-              'ConfiguredVoltage,MaxVoltage,MinVoltage,DataWidth,TotalWidth,'
-              'Attributes | ConvertTo-Json')
-        out, rc = run_cmd(['powershell', '-NoProfile', '-Command', ps])
-        modules = []
-        if rc == 0 and out:
-            try:
-                data = json.loads(out)
-                if not isinstance(data, list): data = [data]
-                types = {0: '?', 20: 'DDR', 21: 'DDR2', 22: 'DDR2 FB-DIMM',
-                         24: 'DDR3', 26: 'DDR4', 34: 'DDR5', 35: 'LPDDR5'}
-                form = {8: 'DIMM', 12: 'SODIMM', 13: 'SRIMM'}
-                for m in data:
-                    cv = m.get('ConfiguredVoltage')
-                    mv = m.get('MaxVoltage')
-                    nv = m.get('MinVoltage')
-                    has_ecc = False
-                    dw = m.get('DataWidth')
-                    tw = m.get('TotalWidth')
-                    # TotalWidth > DataWidth なら ECC
-                    if dw and tw and tw > dw:
-                        has_ecc = True
-                    modules.append({
-                        'slot': (m.get('DeviceLocator') or '').strip(),
-                        'bank': (m.get('BankLabel') or '').strip(),
-                        'capacity': m.get('Capacity', 0),
-                        'speed_mhz': m.get('Speed'),
-                        'conf_mhz': m.get('ConfiguredClockSpeed'),
-                        'manufacturer': (m.get('Manufacturer') or '').strip(),
-                        'part_number': (m.get('PartNumber') or '').strip(),
-                        'serial': (m.get('SerialNumber') or '').strip(),
-                        'type': types.get(m.get('SMBIOSMemoryType'), '?'),
-                        'form': form.get(m.get('FormFactor'), '?'),
-                        'voltage_v': (cv / 1000) if cv else None,
-                        'voltage_min_v': (nv / 1000) if nv else None,
-                        'voltage_max_v': (mv / 1000) if mv else None,
-                        'data_width': dw,
-                        'total_width': tw,
-                        'ecc': has_ecc,
-                    })
-            except Exception:
-                pass
 
-        # メモリアレイ情報（マザーボード搭載量など）
+        types = {0: '?', 20: 'DDR', 21: 'DDR2', 22: 'DDR2 FB-DIMM',
+                 24: 'DDR3', 26: 'DDR4', 34: 'DDR5', 35: 'LPDDR5'}
+        form = {8: 'DIMM', 12: 'SODIMM', 13: 'SRIMM'}
+        modules = []
+
+        # ── Win32_PhysicalMemory: pywin32 で直接 ──
+        rows = self._wmi_query('Win32_PhysicalMemory', [
+            'DeviceLocator', 'BankLabel', 'Capacity', 'Speed',
+            'ConfiguredClockSpeed', 'Manufacturer', 'PartNumber',
+            'SerialNumber', 'FormFactor', 'SMBIOSMemoryType',
+            'ConfiguredVoltage', 'MaxVoltage', 'MinVoltage',
+            'DataWidth', 'TotalWidth'])
+        if rows is not None:
+            for m in rows:
+                cv = m.get('ConfiguredVoltage')
+                mv = m.get('MaxVoltage')
+                nv = m.get('MinVoltage')
+                dw = m.get('DataWidth')
+                tw = m.get('TotalWidth')
+                has_ecc = bool(dw and tw and tw > dw)
+                # Capacity は文字列で来ることがあるので int 化
+                cap = m.get('Capacity') or 0
+                try: cap = int(cap)
+                except (ValueError, TypeError): cap = 0
+                modules.append({
+                    'slot': (m.get('DeviceLocator') or '').strip(),
+                    'bank': (m.get('BankLabel') or '').strip(),
+                    'capacity': cap,
+                    'speed_mhz': m.get('Speed'),
+                    'conf_mhz': m.get('ConfiguredClockSpeed'),
+                    'manufacturer': (m.get('Manufacturer') or '').strip(),
+                    'part_number': (m.get('PartNumber') or '').strip(),
+                    'serial': (m.get('SerialNumber') or '').strip(),
+                    'type': types.get(m.get('SMBIOSMemoryType'), '?'),
+                    'form': form.get(m.get('FormFactor'), '?'),
+                    'voltage_v': (cv / 1000) if cv else None,
+                    'voltage_min_v': (nv / 1000) if nv else None,
+                    'voltage_max_v': (mv / 1000) if mv else None,
+                    'data_width': dw,
+                    'total_width': tw,
+                    'ecc': has_ecc,
+                })
+        else:
+            # PowerShell フォールバック
+            ps = ('Get-CimInstance Win32_PhysicalMemory | Select-Object '
+                  'DeviceLocator,BankLabel,Capacity,Speed,ConfiguredClockSpeed,'
+                  'Manufacturer,PartNumber,SerialNumber,FormFactor,SMBIOSMemoryType,'
+                  'ConfiguredVoltage,MaxVoltage,MinVoltage,DataWidth,TotalWidth,'
+                  'Attributes | ConvertTo-Json')
+            out, rc = run_cmd(['powershell', '-NoProfile', '-Command', ps])
+            if rc == 0 and out:
+                try:
+                    data = json.loads(out)
+                    if not isinstance(data, list): data = [data]
+                    for m in data:
+                        cv = m.get('ConfiguredVoltage')
+                        mv = m.get('MaxVoltage')
+                        nv = m.get('MinVoltage')
+                        has_ecc = False
+                        dw = m.get('DataWidth')
+                        tw = m.get('TotalWidth')
+                        if dw and tw and tw > dw:
+                            has_ecc = True
+                        modules.append({
+                            'slot': (m.get('DeviceLocator') or '').strip(),
+                            'bank': (m.get('BankLabel') or '').strip(),
+                            'capacity': m.get('Capacity', 0),
+                            'speed_mhz': m.get('Speed'),
+                            'conf_mhz': m.get('ConfiguredClockSpeed'),
+                            'manufacturer': (m.get('Manufacturer') or '').strip(),
+                            'part_number': (m.get('PartNumber') or '').strip(),
+                            'serial': (m.get('SerialNumber') or '').strip(),
+                            'type': types.get(m.get('SMBIOSMemoryType'), '?'),
+                            'form': form.get(m.get('FormFactor'), '?'),
+                            'voltage_v': (cv / 1000) if cv else None,
+                            'voltage_min_v': (nv / 1000) if nv else None,
+                            'voltage_max_v': (mv / 1000) if mv else None,
+                            'data_width': dw,
+                            'total_width': tw,
+                            'ecc': has_ecc,
+                        })
+                except Exception:
+                    pass
+
+        # ── Win32_PhysicalMemoryArray: pywin32 で直接 ──
         array_info = {}
-        ps = ('Get-CimInstance Win32_PhysicalMemoryArray | Select-Object '
-              'MaxCapacity,MaxCapacityEx,MemoryDevices,MemoryErrorCorrection '
-              '| ConvertTo-Json')
-        out, rc = run_cmd(['powershell', '-NoProfile', '-Command', ps])
-        if rc == 0 and out:
+        arr_rows = self._wmi_query('Win32_PhysicalMemoryArray', [
+            'MaxCapacity', 'MaxCapacityEx', 'MemoryDevices',
+            'MemoryErrorCorrection'])
+        ecc_map = {0: '?', 1: 'Other', 2: 'Unknown', 3: 'None',
+                   4: 'Parity', 5: 'Single-bit ECC',
+                   6: 'Multi-bit ECC', 7: 'CRC'}
+        if arr_rows:
+            d = arr_rows[0]
+            max_kb = d.get('MaxCapacityEx') or d.get('MaxCapacity')
             try:
-                d = json.loads(out)
-                if isinstance(d, list): d = d[0]
-                # MaxCapacity は KB 単位 (古い形式)、MaxCapacityEx も同じだが正確
-                max_kb = d.get('MaxCapacityEx') or d.get('MaxCapacity')
-                array_info['max_capacity'] = max_kb * 1024 if max_kb else None
-                array_info['slots'] = d.get('MemoryDevices')
-                ecc_map = {0: '?', 1: 'Other', 2: 'Unknown', 3: 'None',
-                           4: 'Parity', 5: 'Single-bit ECC',
-                           6: 'Multi-bit ECC', 7: 'CRC'}
-                array_info['ecc_type'] = ecc_map.get(
-                    d.get('MemoryErrorCorrection'), '?')
-            except Exception:
-                pass
+                max_kb = int(max_kb) if max_kb else 0
+            except (ValueError, TypeError):
+                max_kb = 0
+            array_info['max_capacity'] = max_kb * 1024 if max_kb else None
+            array_info['slots'] = d.get('MemoryDevices')
+            array_info['ecc_type'] = ecc_map.get(
+                d.get('MemoryErrorCorrection'), '?')
+        elif arr_rows is None:
+            # PowerShell フォールバック
+            ps = ('Get-CimInstance Win32_PhysicalMemoryArray | Select-Object '
+                  'MaxCapacity,MaxCapacityEx,MemoryDevices,MemoryErrorCorrection '
+                  '| ConvertTo-Json')
+            out, rc = run_cmd(['powershell', '-NoProfile', '-Command', ps])
+            if rc == 0 and out:
+                try:
+                    d = json.loads(out)
+                    if isinstance(d, list): d = d[0]
+                    max_kb = d.get('MaxCapacityEx') or d.get('MaxCapacity')
+                    array_info['max_capacity'] = max_kb * 1024 if max_kb else None
+                    array_info['slots'] = d.get('MemoryDevices')
+                    array_info['ecc_type'] = ecc_map.get(
+                        d.get('MemoryErrorCorrection'), '?')
+                except Exception:
+                    pass
         return {'modules': modules, 'array': array_info}
 
     def _check_smartctl(self):
@@ -1995,6 +2493,110 @@ $res | ConvertTo-Json -Compress
     def _pdisks(self):
         if platform.system() != 'Windows':
             return []
+        # MSFT_PhysicalDisk と MSFT_StorageReliabilityCounter は
+        # root\Microsoft\Windows\Storage namespace にある
+        ns = 'root\\Microsoft\\Windows\\Storage'
+        media_map = {0: '?', 3: 'HDD', 4: 'SSD', 5: 'SCM'}
+        bus_map = {
+            0: '?', 1: 'SCSI', 2: 'ATAPI', 3: 'ATA', 4: '1394',
+            5: 'SSA', 6: 'Fibre', 7: 'USB', 8: 'RAID', 9: 'iSCSI',
+            10: 'SAS', 11: 'SATA', 12: 'SD', 13: 'MMC', 14: 'Virtual',
+            15: 'File Backed Virtual', 16: 'Storage Spaces', 17: 'NVMe',
+        }
+        health_map = {0: 'Healthy', 1: 'Warning', 2: 'Unhealthy', 3: 'Unknown'}
+
+        disks_rows = self._wmi_query('MSFT_PhysicalDisk', [
+            'FriendlyName', 'Model', 'SerialNumber', 'FirmwareVersion',
+            'MediaType', 'BusType', 'Size', 'HealthStatus',
+            'SpindleSpeed', 'DeviceId'], namespace=ns)
+
+        if disks_rows is not None:
+            # pywin32 ルート
+            result = []
+            for d in disks_rows:
+                dev_id = d.get('DeviceId')
+                # SignalEvent でも構わないが、 ここはシンプルに各 disk について
+                # StorageReliabilityCounter をクエリ (DeviceId で関連付けが必要だが
+                # 単純化のため全件取得して紐付け)
+                temp = poh = read_err = write_err = wear = None
+                try:
+                    # MSFT_StorageReliabilityCounter は ObjectId で MSFT_PhysicalDisk
+                    # と紐付くが、 1 disk = 1 counter の前提でインデックスで紐付ける
+                    counters = self._wmi_query('MSFT_StorageReliabilityCounter', [
+                        'DeviceId', 'Temperature', 'PowerOnHours',
+                        'ReadErrorsTotal', 'WriteErrorsTotal', 'Wear'],
+                        namespace=ns)
+                    if counters:
+                        # DeviceId で照合
+                        for c in counters:
+                            if c.get('DeviceId') == dev_id:
+                                temp = c.get('Temperature')
+                                poh = c.get('PowerOnHours')
+                                read_err = c.get('ReadErrorsTotal')
+                                write_err = c.get('WriteErrorsTotal')
+                                wear = c.get('Wear')
+                                break
+                except Exception:
+                    pass
+
+                spd = d.get('SpindleSpeed') or 0
+                size = d.get('Size') or 0
+                try: size = int(size)
+                except (ValueError, TypeError): size = 0
+                result.append({
+                    'name': (d.get('FriendlyName') or '').strip(),
+                    'model': (d.get('Model') or '').strip(),
+                    'serial': (d.get('SerialNumber') or '').strip(),
+                    'firmware': (d.get('FirmwareVersion') or '').strip(),
+                    'media': media_map.get(d.get('MediaType'),
+                                            str(d.get('MediaType') or '?')),
+                    'bus': bus_map.get(d.get('BusType'),
+                                         str(d.get('BusType') or '?')),
+                    'size': size,
+                    'health': health_map.get(d.get('HealthStatus'),
+                                              str(d.get('HealthStatus') or '?')),
+                    'rpm': spd if spd > 0 else None,
+                    'temp_c': temp,
+                    'hours': poh,
+                    'read_err': read_err,
+                    'write_err': write_err,
+                    'wear': wear,
+                })
+
+            # smartctl で情報補完 (これはコマンド呼び出しなので pywin32 化不可)
+            try:
+                smartctl = self._check_smartctl()
+                if smartctl:
+                    smart_map = self._get_smart_data(smartctl)
+                    for disk in result:
+                        s = disk.get('serial', '').strip()
+                        smart = smart_map.get(s) or smart_map.get(s.replace(' ', ''))
+                        if not smart:
+                            for k, v in smart_map.items():
+                                if s and (k in s or s in k):
+                                    smart = v
+                                    break
+                        if smart:
+                            if not disk.get('temp_c') and smart.get('temperature_c') is not None:
+                                disk['temp_c'] = smart['temperature_c']
+                            if not disk.get('hours') and smart.get('power_on_hours') is not None:
+                                disk['hours'] = smart['power_on_hours']
+                            if disk.get('wear') is None and smart.get('wear_percent') is not None:
+                                disk['wear'] = smart['wear_percent']
+                            disk['data_read'] = smart.get('data_read_bytes')
+                            disk['data_written'] = smart.get('data_written_bytes')
+                            disk['power_cycles'] = smart.get('power_cycles')
+                            disk['unsafe_shutdowns'] = smart.get('unsafe_shutdowns')
+                            disk['media_errors'] = smart.get('media_errors')
+                            disk['critical_warning'] = smart.get('critical_warning')
+                            disk['available_spare'] = smart.get('available_spare_pct')
+                            disk['error_log_entries'] = smart.get('error_log_entries')
+                            disk['smartctl_used'] = True
+            except Exception:
+                pass
+            return result
+
+        # フォールバック: PowerShell (pywin32 が無い環境)
         ps = r'''
 $disks = Get-PhysicalDisk
 $result = foreach ($d in $disks) {
@@ -2121,27 +2723,65 @@ $result | ConvertTo-Json
                 add(*args)
 
         def t_defender():
-            ps = ('Get-MpComputerStatus | Select-Object AntivirusEnabled,'
-                  'RealTimeProtectionEnabled,AntivirusSignatureLastUpdated,'
-                  'QuickScanAge | ConvertTo-Json')
-            out, rc = run_cmd(['powershell', '-NoProfile', '-Command', ps], timeout=8)
-            if rc == 0 and out:
-                try:
-                    d = json.loads(out)
-                    s_add('ANTIVIRUS', 'pass' if d.get('AntivirusEnabled') else 'fail',
-                        'Defender Antivirus',
-                        'enabled' if d.get('AntivirusEnabled') else 'DISABLED')
-                    s_add('ANTIVIRUS', 'pass' if d.get('RealTimeProtectionEnabled') else 'fail',
-                        'Real-time protection',
-                        'enabled' if d.get('RealTimeProtectionEnabled') else 'DISABLED')
-                    qs = d.get('QuickScanAge')
-                    if qs is not None and qs >= 0:
-                        st = 'pass' if qs < 7 else ('warn' if qs < 30 else 'fail')
-                        s_add('ANTIVIRUS', st, 'Last quick scan', f'{qs} days ago')
-                except Exception:
-                    pass
+            # pywin32 で root\Microsoft\Windows\Defender:MSFT_MpComputerStatus
+            rows = self._wmi_query('MSFT_MpComputerStatus', [
+                'AntivirusEnabled', 'RealTimeProtectionEnabled',
+                'QuickScanAge'],
+                namespace='root\\Microsoft\\Windows\\Defender')
+            if rows:
+                d = rows[0]
+                av = d.get('AntivirusEnabled')
+                rt = d.get('RealTimeProtectionEnabled')
+                qs = d.get('QuickScanAge')
+                s_add('ANTIVIRUS', 'pass' if av else 'fail',
+                    'Defender Antivirus',
+                    'enabled' if av else 'DISABLED')
+                s_add('ANTIVIRUS', 'pass' if rt else 'fail',
+                    'Real-time protection',
+                    'enabled' if rt else 'DISABLED')
+                if qs is not None and qs >= 0:
+                    st = 'pass' if qs < 7 else ('warn' if qs < 30 else 'fail')
+                    s_add('ANTIVIRUS', st, 'Last quick scan', f'{qs} days ago')
+                return
+            if rows is None:
+                # PowerShell フォールバック
+                ps = ('Get-MpComputerStatus | Select-Object AntivirusEnabled,'
+                      'RealTimeProtectionEnabled,AntivirusSignatureLastUpdated,'
+                      'QuickScanAge | ConvertTo-Json')
+                out, rc = run_cmd(['powershell', '-NoProfile', '-Command', ps], timeout=8)
+                if rc == 0 and out:
+                    try:
+                        d = json.loads(out)
+                        s_add('ANTIVIRUS', 'pass' if d.get('AntivirusEnabled') else 'fail',
+                            'Defender Antivirus',
+                            'enabled' if d.get('AntivirusEnabled') else 'DISABLED')
+                        s_add('ANTIVIRUS', 'pass' if d.get('RealTimeProtectionEnabled') else 'fail',
+                            'Real-time protection',
+                            'enabled' if d.get('RealTimeProtectionEnabled') else 'DISABLED')
+                        qs = d.get('QuickScanAge')
+                        if qs is not None and qs >= 0:
+                            st = 'pass' if qs < 7 else ('warn' if qs < 30 else 'fail')
+                            s_add('ANTIVIRUS', st, 'Last quick scan', f'{qs} days ago')
+                    except Exception:
+                        pass
 
         def t_firewall():
+            # pywin32 で root\StandardCimv2:MSFT_NetFirewallProfile
+            rows = self._wmi_query('MSFT_NetFirewallProfile',
+                                    ['Name', 'Enabled'],
+                                    namespace='root\\StandardCimv2')
+            if rows is not None:
+                # Name は 1=Domain, 2=Private, 4=Public
+                name_map = {1: 'Domain', 2: 'Private', 4: 'Public'}
+                for p in rows:
+                    n = p.get('Name')
+                    name_str = name_map.get(n, str(n))
+                    enabled = bool(p.get('Enabled') == 1 or p.get('Enabled') is True)
+                    s_add('FIREWALL', 'pass' if enabled else 'fail',
+                        f"Firewall: {name_str}",
+                        'enabled' if enabled else 'DISABLED')
+                return
+            # PowerShell フォールバック
             ps = 'Get-NetFirewallProfile | Select-Object Name,Enabled | ConvertTo-Json'
             out, rc = run_cmd(['powershell', '-NoProfile', '-Command', ps], timeout=6)
             if rc == 0 and out:
@@ -2156,6 +2796,20 @@ $result | ConvertTo-Json
                     pass
 
         def t_bitlocker():
+            # pywin32 で root\CIMV2\Security\MicrosoftVolumeEncryption:Win32_EncryptableVolume
+            # ProtectionStatus: 0=Off, 1=On, 2=Unknown
+            rows = self._wmi_query('Win32_EncryptableVolume',
+                                    ['DriveLetter', 'ProtectionStatus'],
+                                    namespace='root\\CIMV2\\Security\\MicrosoftVolumeEncryption')
+            if rows is not None:
+                for v in rows:
+                    mp = v.get('DriveLetter') or '?'
+                    st = v.get('ProtectionStatus') or 0
+                    s_add('ENCRYPTION', 'pass' if st == 1 else 'warn',
+                        f'BitLocker ({mp})',
+                        'encrypted' if st == 1 else 'not encrypted')
+                return
+            # PowerShell フォールバック
             ps = ('Get-BitLockerVolume | Select-Object MountPoint,'
                   'ProtectionStatus | ConvertTo-Json')
             out, rc = run_cmd(['powershell', '-NoProfile', '-Command', ps], timeout=8)
@@ -2190,19 +2844,53 @@ $result | ConvertTo-Json
                     'SmartScreen', 'disabled' if 'Off' in out else 'enabled')
 
         def t_updates():
-            ps = ('(Get-CimInstance Win32_QuickFixEngineering | '
-                  'Sort-Object InstalledOn -Descending | Select-Object -First 1).'
-                  'InstalledOn.ToString("yyyy-MM-dd")')
-            out, rc = run_cmd(['powershell', '-NoProfile', '-Command', ps], timeout=8)
-            if rc == 0 and out:
-                try:
-                    d = datetime.strptime(out.strip(), '%Y-%m-%d')
-                    days = (datetime.now() - d).days
+            # pywin32 で Win32_QuickFixEngineering
+            rows = self._wmi_query('Win32_QuickFixEngineering',
+                                    ['HotFixID', 'InstalledOn'])
+            if rows:
+                # 最新の InstalledOn を抽出
+                dates = []
+                for r in rows:
+                    inst = r.get('InstalledOn')
+                    if inst:
+                        # 文字列 "M/D/YYYY" の場合もある
+                        try:
+                            if hasattr(inst, 'strftime'):
+                                dates.append(inst)
+                            else:
+                                # 文字列なら parse
+                                from datetime import datetime as _dt
+                                for fmt in ('%m/%d/%Y', '%Y-%m-%d',
+                                             '%Y/%m/%d', '%d/%m/%Y'):
+                                    try:
+                                        dates.append(_dt.strptime(str(inst), fmt))
+                                        break
+                                    except Exception:
+                                        continue
+                        except Exception:
+                            pass
+                if dates:
+                    latest = max(dates)
+                    days = (datetime.now() - latest).days
                     st = 'pass' if days < 30 else ('warn' if days < 90 else 'fail')
                     s_add('UPDATES', st, 'Last Windows Update',
-                        f"{out.strip()} ({days}d ago)")
-                except Exception:
-                    pass
+                        f"{latest.strftime('%Y-%m-%d')} ({days}d ago)")
+                return
+            if rows is None:
+                # PowerShell フォールバック
+                ps = ('(Get-CimInstance Win32_QuickFixEngineering | '
+                      'Sort-Object InstalledOn -Descending | Select-Object -First 1).'
+                      'InstalledOn.ToString("yyyy-MM-dd")')
+                out, rc = run_cmd(['powershell', '-NoProfile', '-Command', ps], timeout=8)
+                if rc == 0 and out:
+                    try:
+                        d = datetime.strptime(out.strip(), '%Y-%m-%d')
+                        days = (datetime.now() - d).days
+                        st = 'pass' if days < 30 else ('warn' if days < 90 else 'fail')
+                        s_add('UPDATES', st, 'Last Windows Update',
+                            f"{out.strip()} ({days}d ago)")
+                    except Exception:
+                        pass
 
         def t_wifi():
             out, rc = run_cmd(['netsh', 'wlan', 'show', 'interfaces'], timeout=4)
@@ -2279,8 +2967,13 @@ class Chart(tk.Canvas):
         self._series = []  # [(data_list, color, fill_color), ...]
         self._max_pct = None
         self._log_scale = False
+        # log_scale 時の下限 (bytes/s)。 0 なら log1p (小さい値が持ち上がる)、
+        # >0 なら「下限付き真 log」で、 この値未満は底 (0%) に張り付く。
+        # DISK I/O のように KB〜GB の桁差を表現したい時に floor を設定する。
+        self._log_floor = 0
         self._overlay = []
         self._bg_bars = None    # 現在描画中のバー値 (アニメ補間後)
+        self._bg_bar_split = None  # この index 以降のバーを天井から下向きに描画
         self._side_pane = None  # 右側ペイン [(text, color, font_size), ...]
         self._side_width = 0    # 右ペインの幅
         self._side_pane_compact = False  # True で上端から統一フォントで描画
@@ -2361,7 +3054,8 @@ class Chart(tk.Canvas):
                    bar_subvalues=None, extra_series=None, bar_meta=None,
                    bg_bar_colors=None, bg_bar_labels=None,
                    bg_bar_sublabels=None, bg_bar_stipple=None,
-                   bg_bar_label_colors=None, side_pane_compact=False):
+                   bg_bar_label_colors=None, side_pane_compact=False,
+                   bg_bar_split=None):
         """
         bg_bars: 背景の縦棒 (CPUコアなど) - 0-100 の値リスト
         bar_subvalues: 各棒の下に表示する数値リスト（電圧のみ）の旧形式
@@ -2417,6 +3111,9 @@ class Chart(tk.Canvas):
         self._bg_bar_stipple = bg_bar_stipple
         self._bg_bar_label_colors = bg_bar_label_colors
         self._side_pane_compact = side_pane_compact
+        # bg_bar_split: この index 以降のバーを「天井から下向き」に描画する。
+        # 物理コア (前半) を下から、 HT/仮想スレッド (後半) を上から描いて区別する用途。
+        self._bg_bar_split = bg_bar_split
         self.redraw()
 
     def redraw(self):
@@ -2441,12 +3138,14 @@ class Chart(tk.Canvas):
             plot_bot = h
             plot_h = h
 
-        # 空シリーズ
+        # 空シリーズ: chart_label が設定されていればそれを表示、
+        # 無ければデフォルトの '// no data' を表示
         if not self._series:
             if self._side_pane:
                 self._draw_side_pane(w, h)
+            msg = self._chart_label or '// no data'
             self.create_text(chart_w / 2, h / 2,
-                              text='// no data', fill=DIM,
+                              text=msg, fill=DIM,
                               font=("Courier New", 9))
             return
 
@@ -2464,13 +3163,27 @@ class Chart(tk.Canvas):
                     max_val = max(max_val, max(data))
             max_val = max(max_val, 1.0)
 
-        def y_of(v):
-            v = max(0, min(v, max_val))
+        def _ratio(v, vmax):
+            """値 v を 0.0〜1.0 の描画比率に変換 (線形 / log1p / 下限付き真log)"""
+            if vmax <= 0:
+                return 0
+            v = max(0, min(v, vmax))
             if self._log_scale:
-                ratio = math.log1p(v) / math.log1p(max_val) if max_val > 0 else 0
-            else:
-                ratio = v / max_val if max_val > 0 else 0
-            return plot_bot - ratio * plot_h
+                floor = self._log_floor
+                if floor and floor > 0:
+                    # 下限付き真 log: floor 未満は底、 floor〜vmax を log で展開
+                    if v <= floor:
+                        return 0
+                    denom = math.log(vmax) - math.log(floor)
+                    if denom <= 0:
+                        return 0
+                    return min(1.0, (math.log(v) - math.log(floor)) / denom)
+                # log1p (小さい値が持ち上がる、 従来互換)
+                return math.log1p(v) / math.log1p(vmax) if vmax > 0 else 0
+            return v / vmax
+
+        def y_of(v):
+            return plot_bot - _ratio(v, max_val) * plot_h
 
         # ① 塗りつぶしを先に（背景バーより下）
         for data, line_color, fill_color in self._series:
@@ -2492,22 +3205,31 @@ class Chart(tk.Canvas):
             if n > 0:
                 gap = 2
                 bar_w = max(2, (chart_w - gap * (n + 1)) / n)
+                split = self._bg_bar_split
                 for i, pct in enumerate(self._bg_bars):
                     x = gap + i * (bar_w + gap)
                     # バーは plot area 内に描画
                     bh = (pct / 100) * plot_h
-                    y = plot_bot - bh
+                    # split 以降 (HT/仮想スレッド) は天井から下向きに描画
+                    from_top = split is not None and i >= split
+                    if from_top:
+                        bar_top = plot_top
+                        bar_bot = plot_top + bh
+                    else:
+                        bar_top = plot_bot - bh
+                        bar_bot = plot_bot
+                    y = bar_top  # 既存コードとの互換 (ラベル位置計算で使用)
                     # 色: カスタム指定 or デフォルトのグレーブルー
                     bar_color = (self._bg_bar_colors[i]
                                   if (self._bg_bar_colors
                                       and i < len(self._bg_bar_colors))
                                   else '#5a7090')
                     if self._bg_bar_stipple:
-                        self.create_rectangle(x, y, x + bar_w, plot_bot,
+                        self.create_rectangle(x, bar_top, x + bar_w, bar_bot,
                                               fill=bar_color, outline='',
                                               stipple=self._bg_bar_stipple)
                     else:
-                        self.create_rectangle(x, y, x + bar_w, plot_bot,
+                        self.create_rectangle(x, bar_top, x + bar_w, bar_bot,
                                               fill=bar_color, outline='')
                     if bar_w >= 14:
                         # 棒のラベル: カスタム or デフォルト(%)
@@ -2525,7 +3247,14 @@ class Chart(tk.Canvas):
                             # デフォルト: バーの上空中に %値
                             label_text = str(int(pct))
                             label_color = '#ffffff'   # 白 + 影で見やすく
-                            label_y = y - 8
+                            if from_top:
+                                # 天井から下向きのバー: ラベルはバー下端 (先端) の下に
+                                label_y = min(plot_bot - 8, bar_bot + 8)
+                            else:
+                                # バーが 100% (y = plot_top) のとき y - 8 だとチャート外に
+                                # はみ出てしまう。最低でも plot_top + 8 (バーの内側上端から
+                                # 少し下) に表示するようにクランプ。
+                                label_y = max(plot_top + 8, y - 8)
 
                         # バー数字描画 (常に上部、白 + 黒影で見やすく)
                         if label_text and label_y is not None:
@@ -2667,7 +3396,8 @@ class Chart(tk.Canvas):
             for i, v in enumerate(data):
                 if v is None:
                     continue
-                ratio = min(1.0, max(0, v / value_max))
+                # メイン系列と同じ _ratio を使う (log_scale / log_floor を尊重)
+                ratio = _ratio(v, value_max)
                 xx, yy = i * step, h - ratio * h
                 pts.extend([xx, yy])
                 last_x, last_y, last_v = xx, yy, v
@@ -3277,13 +4007,28 @@ class HeatmapCell(tk.Canvas):
 
 class NetSysApp:
     def __init__(self, root):
+        # ── 起動タイミング測定 (環境変数 NETSYS_TIMING=1 で stdout に出力) ──
+        # 起動が遅い場合に、どのステップが時間を食っているかを見るためのプロファイル。
+        # 通常はオフ。`set NETSYS_TIMING=1` してから python net_sys.py で有効化。
+        self.__t_enable = os.environ.get('NETSYS_TIMING') == '1'
+        self.__t_start = time.perf_counter()
+        def _ts(label):
+            if self.__t_enable:
+                t = time.perf_counter() - self.__t_start
+                print(f"[startup {t:6.3f}s] {label}", flush=True)
+        self.__ts = _ts
+        _ts("__init__ start")
+
         self.root = root
         self.config = load_config()
+        _ts("after load_config")
         # テーマを適用
         self._apply_theme_from_config()
 
         self.collector = Collector()
+        _ts("after Collector()")
         self.static_data = self.collector.static()
+        _ts("after collector.static()")
         self._closed = False
 
         # ウィジェット参照
@@ -3303,6 +4048,9 @@ class NetSysApp:
         self._disk_cycle = -1       # -1=ALL, 0..N-1=個別ボリューム
         self._last_disks = []
         self._selected_nic = 'ALL'
+        # NIC リストが初めて取れた時に、 ノート PC ならデフォルトを WiFi にするフラグ
+        # (1 回だけ実行。 以降はユーザーの選択を尊重)
+        self._nic_default_applied = False
         self._last_nics_map = {}
         self._last_dimm_data = None
         self._lhm_status = (False, None)  # (running, name)
@@ -3338,21 +4086,30 @@ class NetSysApp:
                 print(f'[alerts] {e}')
                 self.alert_mgr = None
 
+        # ── 起動タイミング測定 (続き) ──
+        _ts = self.__ts
+
         self._setup_root()
+        _ts("after _setup_root")
         self._build_ui()
+        _ts("after _build_ui")
         # 透明度適用
         self._apply_alpha(self.config.get('alpha', 1.0))
         # 最前面表示の初期化
         self._apply_always_on_top_initial()
+        _ts("after alpha/topmost")
 
         self._tick_clock()
+        _ts("after _tick_clock")
         self._tick_live()
-        # 進捗バーを確実に描画してから 100ms 後にバックグラウンド初回ロード
-        self.root.update_idletasks()
-        self.root.update()
+        _ts("after _tick_live (1st live call)")
+        # update_idletasks も update も呼ばず、 描画・ジオメトリ計算は全て mainloop に任せる。
+        # 旧: update_idletasks (0.9s) + update (1.6s) で __init__ がブロックされ、
+        #     bg_init 開始が大幅に遅れていた。
+        # 新: __init__ は _tick_live 完了で即終了 → mainloop が描画と bg_init を並行処理。
+        _ts("after init (no forced paint)")
         self._init_started_at = time.time()
-        # 50ms 後にバックグラウンド初期化開始 (旧 150ms)
-        # この遅延の意味: 最初の UI フレームが描画されてから重い処理を開始
+        # 50ms 後にバックグラウンド初期化開始 (mainloop 開始直後)
         self.root.after(50,
             lambda: threading.Thread(target=self._background_init,
                                        daemon=True).start())
@@ -3501,6 +4258,16 @@ class NetSysApp:
                         selectbackground=BORDER,
                         selectforeground=TEXT_BRIGHT,
                         font=FONT_MONO_XS)
+        # ★ readonly state は configure では反映されず map での指定が必要。
+        #   readonly Combobox は表示テキストを「選択状態」として描画するため、
+        #   selectbackground/selectforeground を設定しないと OS デフォルト
+        #   (青帯 + 見えにくい文字色) になり、 値があっても表示が空に見える。
+        style.map('NS.TCombobox',
+                  fieldbackground=[('readonly', SURFACE)],
+                  foreground=[('readonly', TEXT_BRIGHT)],
+                  selectbackground=[('readonly', SURFACE)],
+                  selectforeground=[('readonly', TEXT_BRIGHT)],
+                  arrowcolor=[('readonly', ACCENT)])
         # ドロップダウンリストの色（ややハック）
         self.root.option_add('*TCombobox*Listbox.background', SURFACE)
         self.root.option_add('*TCombobox*Listbox.foreground', TEXT)
@@ -3631,7 +4398,13 @@ class NetSysApp:
         components = []
 
         # CPU 使用率 (95%以上で -20, 80%以上で -10)
-        cpu = d.get('cpu_all')
+        # 瞬間値だとスパイクで score が頻繁に揺れるので、
+        # 直近 5 サンプル (= 5 秒) の平均値で判定
+        cpu_hist = d.get('cpu_history', []) or []
+        if cpu_hist:
+            cpu = sum(cpu_hist[-5:]) / min(5, len(cpu_hist))
+        else:
+            cpu = d.get('cpu_all')
         if cpu is not None:
             p = 20 if cpu > 95 else 10 if cpu > 80 else 0
             components.append(('CPU', 100 - p * 5, p))  # 表示用スコアと減点
@@ -3676,7 +4449,15 @@ class NetSysApp:
 
         # 総合スコア
         total_penalty = sum(c[2] for c in components) + alert_pen
-        score = max(0, 100 - total_penalty)
+        raw_score = max(0, 100 - total_penalty)
+
+        # 5 秒移動平均でスムージング (ノート PC で CPU 負荷が激しく
+        # 上下するときの見た目の落ち着き)
+        if not hasattr(self, 'health_score_history'):
+            self.health_score_history = deque(maxlen=5)
+        self.health_score_history.append(raw_score)
+        score = int(round(sum(self.health_score_history)
+                          / len(self.health_score_history)))
 
         # ── 個別メトリクスのスコア計算 (0-100、高い = 健康) ──
         # クリック時に切り替えて表示するための値を辞書化
@@ -3981,36 +4762,40 @@ class NetSysApp:
         gpu_clock = gx.get('clock')
         gpu_fan = gx.get('fan')
 
-        # ── サイドペイン構築 (CPU LOAD と同じ順序感: usage → clock → temp → watts → fan) ──
-        # 線として描画する項目 (gpu, pwr) は、ラベルと値を線色で塗って対応を明示する
-        # GPU_LINE_COLOR    = ACCENT (シアン、実線)  ← usage
-        # GPU_PWR_LINE_COLOR= YELLOW (黄、破線)      ← pwr
+        # ── サイドペイン構築 ──
+        # 並び順: 線グラフの Y 軸位置 (高い順) に対応させる
+        #   1. clock (オレンジ 破線、 通常 GPU 動作中は高位置 MHz)
+        #   2. temp  (赤 破線、 通常 中位置 °C)
+        #   3. gpu   (シアン 実線+塗り、 通常 低位置 %、 usage)
+        #   4. pwr   (黄 破線、 ほぼ底)
+        #   5. fan   (チャートには出さない、 N/A は最後)
+        # 線として描画する項目 (gpu, pwr, clock, temp) は、ラベル色を線色と一致させる
         side = []
 
-        # usage (%) — チャートの ACCENT (シアン) 線と対応
+        # clock (MHz) — チャートのオレンジ (破線) と対応
+        ORANGE_CLK_LBL = '#ff9a3d'
+        side.append(("clock", ORANGE_CLK_LBL, 8))
+        if gpu_clock is not None:
+            side.append((f"{int(gpu_clock)} MHz", ORANGE_CLK_LBL, 10))
+        else:
+            side.append(("N/A", DIM, 9))
+        side.append(("___", None, 0))
+
+        # temp (°C) — チャートの赤 (破線) と対応
+        RED_TEMP_LBL = '#ff6b6b'
+        side.append(("temp", RED_TEMP_LBL, 8))
+        if gpu_temp is not None:
+            side.append((f"{gpu_temp:.0f}\u00b0C", RED_TEMP_LBL, 10))
+        else:
+            side.append(("N/A", DIM, 9))
+        side.append(("___", None, 0))
+
+        # usage (%) — チャートの ACCENT (シアン) 線と対応 (主シリーズ)
         side.append(("gpu", ACCENT, 8))
         if usage is not None:
             side.append((f"{usage:.0f}%", ACCENT, 14))
         else:
             side.append(("N/A", DIM, 10))
-        side.append(("___", None, 0))
-
-        # clock (MHz) — チャートには出さない
-        side.append(("clock", MUTED, 8))
-        if gpu_clock is not None:
-            side.append((f"{int(gpu_clock)} MHz", TEXT, 10))
-        else:
-            side.append(("N/A", DIM, 9))
-        side.append(("___", None, 0))
-
-        # temp (°C) — チャートには出さない
-        side.append(("temp", MUTED, 8))
-        if gpu_temp is not None:
-            tcolor = RED if gpu_temp > 85 else ('#ff8a3d' if gpu_temp > 75
-                      else (YELLOW if gpu_temp > 60 else GREEN))
-            side.append((f"{gpu_temp:.0f}\u00b0C", tcolor, 10))
-        else:
-            side.append(("N/A", DIM, 9))
         side.append(("___", None, 0))
 
         # power (W) — チャートの YELLOW (黄、破線) と対応
@@ -4024,7 +4809,7 @@ class NetSysApp:
             side.append(("N/A", DIM, 9))
         side.append(("___", None, 0))
 
-        # fan (%) — チャートには出さない
+        # fan (%) — チャートには出さない、 N/A は最後
         side.append(("fan", MUTED, 8))
         if gpu_fan is not None:
             fcolor = RED if gpu_fan > 80 else (YELLOW if gpu_fan > 60 else GREEN)
@@ -4032,12 +4817,12 @@ class NetSysApp:
         else:
             side.append(("N/A", DIM, 9))
 
-        # ── メインチャート: usage 実線 (シアン) + pwr 破線 (黄) の 2 本構成 ──
-        # 色は両方ともサイドペインのラベル色と一致させてある (視覚的対応)
-        # メインチャート: usage (ACCENT 実線+塗り) + power (YELLOW 破線)
-        # ただし、iGPU 等で usage が N/A の場合は、clock または temp を主シリーズとして描く
-        # (グラフが空っぽにならないようフォールバック)
-        # チャート内に文字 (chart_label) は出さない
+        # ── メインチャート: 最大 4 本の線を重ねる ──
+        # usage (シアン 実線+塗り) ─ メイン (取れない場合は clock を代用)
+        # clock (オレンジ 破線) ─ extra
+        # temp  (赤 破線)       ─ extra
+        # pwr   (黄 破線)       ─ extra
+        # 色はサイドペインのラベル色と一致させてある (視覚的対応)
         gpu_pwr_hist  = e.get('gpu_power_history') or []
         gpu_clk_hist  = e.get('gpu_clock_history') or []
         gpu_temp_hist = e.get('gpu_temp_history') or []
@@ -4047,70 +4832,73 @@ class NetSysApp:
                            if u is not None and u > 0]
         has_usage = bool(usage_filtered)
 
+        # 追加シリーズを構築する共通関数
+        # 各シリーズに独自のスケール max を与えれば、0-100% の同一描画領域で
+        # ピーク同士が並ぶように見える
+        ORANGE_CLK = '#ff9a3d'   # GPU clock 線色 (オレンジ、サイドペインと一致)
+        RED_TEMP   = '#ff6b6b'   # GPU temp 線色 (赤、サイドペインと一致)
+        extra_series = []
+
+        # clock 線 (常に追加、データがあれば描画)
+        clk_filtered = [c for c in gpu_clk_hist if c is not None and c > 0]
+        if clk_filtered:
+            clk_max = max(clk_filtered) * 1.15  # 上 15% 余裕
+            extra_series.append((gpu_clk_hist, ORANGE_CLK, clk_max))
+
+        # temp 線
+        temp_filtered = [t for t in gpu_temp_hist if t is not None]
+        if temp_filtered:
+            tmax = max(85, max(temp_filtered) * 1.15)
+            extra_series.append((gpu_temp_hist, RED_TEMP, tmax))
+
+        # power 線
+        # 0W のときも線を描画 (底に張り付くだけ)。これにより
+        # 「pwr が取れていない」と「pwr=0」の区別が付くようになる。
+        # データ自体が無い (None ばかり) 場合のみスキップ。
+        pwr_filtered = [p for p in gpu_pwr_hist if p is not None]
+        if pwr_filtered:
+            pwr_max = max(5, max(pwr_filtered) * 1.5)  # 最低 5W スケール
+            extra_series.append((gpu_pwr_hist, YELLOW, pwr_max))
+
         if has_usage:
-            # 通常モード: usage を主シリーズ + power を破線
-            pwr_filtered = [p for p in gpu_pwr_hist if p is not None]
-            if pwr_filtered and max(pwr_filtered) > 0:
-                pwr_max = max(5, max(pwr_filtered) * 1.5)
-                extra = [(gpu_pwr_hist, YELLOW, pwr_max)]
-            else:
-                extra = None
+            # 通常モード: usage を主シリーズ + 他は破線で重ねる
             self.chart_gpu_combined.set_series(
                 [(usage_hist, ACCENT, '#0d3d52')],
                 max_pct=100,
-                extra_series=extra,
+                extra_series=extra_series or None,
                 side_pane=side, side_width=90,
                 side_pane_compact=True)
-        elif gpu_clk_hist:
-            # フォールバック A: clock 履歴を主シリーズに (% 換算で描画)
-            # iGPU で usage が出ない場合でも、クロック変動でアクティビティが見える
-            clk_filtered = [c for c in gpu_clk_hist if c is not None and c > 0]
-            if clk_filtered:
-                clk_max = max(clk_filtered) * 1.2  # 上 20% 余裕
-                # ChartFrame は 0-100 % スケールなので、clock を百分率にスケール
-                clk_scaled = [(c / clk_max * 100) if c is not None else 0
-                              for c in gpu_clk_hist]
-                # temp が取れていれば extra series で破線追加
-                temp_filtered = [t for t in gpu_temp_hist if t is not None]
-                if temp_filtered:
-                    extra = [(gpu_temp_hist, YELLOW, max(85, max(temp_filtered) * 1.2))]
-                else:
-                    extra = None
-                self.chart_gpu_combined.set_series(
-                    [(clk_scaled, ACCENT, '#0d3d52')],
-                    max_pct=100,
-                    extra_series=extra,
-                    side_pane=side, side_width=90,
-                    side_pane_compact=True)
-            else:
-                self.chart_gpu_combined.set_series(
-                    [],
-                    side_pane=side, side_width=90,
-                    side_pane_compact=True)
-        elif gpu_temp_hist:
+        elif clk_filtered:
+            # フォールバック: usage が無いので、clock を主線として使う
+            # (iGPU でよくある状況)
+            # clock 自体は extra_series から除き、メイン線として描画
+            extra_no_clk = [s for s in extra_series
+                            if not (s[1] == ORANGE_CLK)]
+            clk_max = max(clk_filtered) * 1.15
+            clk_scaled = [(c / clk_max * 100) if c is not None else 0
+                          for c in gpu_clk_hist]
+            self.chart_gpu_combined.set_series(
+                [(clk_scaled, ACCENT, '#0d3d52')],
+                max_pct=100,
+                extra_series=extra_no_clk or None,
+                side_pane=side, side_width=90,
+                side_pane_compact=True)
+        elif temp_filtered:
             # フォールバック B: temp だけ取れる
-            temp_filtered = [t for t in gpu_temp_hist if t is not None]
-            if temp_filtered:
-                tmax = max(85, max(temp_filtered) * 1.2)
-                temp_scaled = [(t / tmax * 100) if t is not None else 0
-                               for t in gpu_temp_hist]
-                self.chart_gpu_combined.set_series(
-                    [(temp_scaled, YELLOW, None)],
-                    max_pct=100,
-                    side_pane=side, side_width=90,
-                    side_pane_compact=True)
-            else:
-                self.chart_gpu_combined.set_series(
-                    [],
-                    side_pane=side, side_width=90,
-                    side_pane_compact=True)
+            tmax = max(85, max(temp_filtered) * 1.15)
+            temp_scaled = [(t / tmax * 100) if t is not None else 0
+                           for t in gpu_temp_hist]
+            self.chart_gpu_combined.set_series(
+                [(temp_scaled, RED_TEMP, None)],
+                max_pct=100,
+                side_pane=side, side_width=90,
+                side_pane_compact=True)
         else:
             # 履歴が完全に空 (起動直後など)
             self.chart_gpu_combined.set_series(
                 [],
                 side_pane=side, side_width=90,
                 side_pane_compact=True)
-
     def _update_temp_gauges(self):
         """温度ゲージ (CPU/GPU/SSD) を更新"""
         e = self._latest_extras_data or {}
@@ -4180,15 +4968,28 @@ class NetSysApp:
         # disk_read_history / disk_write_history は disk_read_rate /
         # disk_write_rate を時系列に積んだもの。円も同じ rate を使うことで
         # 「線の最新値 = 円の値」となり、両者が完全に同期する。
+        # ★ ただし psutil の disk I/O は瞬間値が 0 ↔ ピーク を毎秒往復する性質があり
+        # 「最新 1 サンプル」を表示すると円が一瞬光って消える挙動になる。
+        # → 直近 3 サンプル (3 秒) の max を表示して、 短いパルスの余韻を残す。
         read_hist = d.get('disk_read_history', []) or []
         write_hist = d.get('disk_write_history', []) or []
-        total_r = read_hist[-1] if read_hist else (d.get('disk_read_rate', 0) or 0)
-        total_w = write_hist[-1] if write_hist else (d.get('disk_write_rate', 0) or 0)
+        recent_r = read_hist[-3:] if read_hist else []
+        recent_w = write_hist[-3:] if write_hist else []
+        total_r = max(recent_r) if recent_r else (d.get('disk_read_rate', 0) or 0)
+        total_w = max(recent_w) if recent_w else (d.get('disk_write_rate', 0) or 0)
 
-        # スケール: 観測値に応じて自動調整 (棒バージョンと同じ階段)
-        max_observed = max(total_r, total_w)
-        target = max(max_observed * 1.5, 5 * 1024 * 1024)
+        # スケール: 観測値に応じて自動調整。直近 10 サンプルの max で算出することで
+        # 過去ピークが残り続ける問題を回避 (chart_dio の _auto_scale と同じロジック)。
+        # フロア 128KB で KB レベルの read リングも見えるように。
+        recent_all = (read_hist + write_hist)[-20:]  # 直近 10 サンプル × 2 系列
+        max_observed = max(recent_all) if recent_all else max(total_r, total_w)
+        target = max(max_observed * 1.5, 128 * 1024)  # フロア 128 KB/s
         scale_steps = [
+            128 * 1024,         # 128 KB/s
+            256 * 1024,         # 256 KB/s
+            512 * 1024,         # 512 KB/s
+            1 * 1024 * 1024,    # 1 MB/s
+            2 * 1024 * 1024,    # 2 MB/s
             5 * 1024 * 1024,    # 5 MB/s
             10 * 1024 * 1024,   # 10 MB/s
             20 * 1024 * 1024,   # 20 MB/s
@@ -4213,7 +5014,7 @@ class NetSysApp:
         w_pct = max(0, min(100, w_pct))
 
         # 速度を短い文字列に整形 (狭い円中央に収める: 最大 4 文字)
-        # 例: "999K" / "12M" / "3.2M" / "999M" / "1.5G"
+        # 例: "999K" / "12M" / "3.2M" / "999M" / "1.5G" / "0K"
         def _fmt_rate(rate_bytes):
             mb = rate_bytes / (1024 * 1024)
             if mb >= 1000:
@@ -4227,7 +5028,8 @@ class NetSysApp:
                 return f"{kb:.0f}K"
             if kb >= 1:
                 return f"{kb:.1f}K"
-            return "0"
+            # 0 ~ 1KB 未満も "0K" 表記で統一 (単位なしより read/write の対称性が良い)
+            return "0K"
 
         w_str = _fmt_rate(total_w)
         r_str = _fmt_rate(total_r)
@@ -4499,8 +5301,9 @@ class NetSysApp:
             pady=0, bd=0)
         self.init_progress_status.pack(side='left', padx=(8, 0))
 
-        # 進捗状態
-        self._init_total = 4  # LHM/details/security/extras の4タスク
+        # 進捗状態: lhm / heavy(sensors) / details の 3 タスク
+        # (security は lazy load に変更したのでカウントから除外)
+        self._init_total = 3
         self._init_done = 0
         self._init_current_label = 'LOADING'
         self._init_status_text = 'starting...'
@@ -4525,6 +5328,12 @@ class NetSysApp:
         if self.tab_history is not None:
             self._build_history()
         self._build_settings()
+
+        # ── Lazy ロード: SYSTEM / PROCS&SECURITY タブを初めて開いたときに
+        # 重い PowerShell 取得を起動する。起動直後の負荷を大幅に減らせる。
+        self._lazy_details_loaded = False
+        self._lazy_security_loaded = False
+        self.notebook.bind('<<NotebookTabChanged>>', self._on_tab_changed_lazy)
 
         # ── ステータスバー ────────────────────────────
         status = tk.Frame(self.root, bg=HEADER, height=22)
@@ -4874,6 +5683,11 @@ class NetSysApp:
         self.chart_dio = Chart(io_hist_wrap, height=60, bg=PANEL,
                                  width=200)
         self.chart_dio.pack(fill='x')
+        # DISK I/O は KB〜MB の桁差を log スケールで表現する。
+        # レンジを 16KB〜64MB (約3.6桁) に絞ることで 1桁あたりの段差を大きくする
+        # (レンジが広すぎると桁が変わっても段差が小さくなり違いが見えない)。
+        # 16KB 未満は底に張り付き、 それ以上は対数で展開。
+        self.chart_dio._log_floor = 16 * 1024
         # クリックハンドラ: read / write のどちらを破線にするかをトグル
         # 0: read 破線 (write が実線で目立つ、デフォルト)
         # 1: write 破線 (read が実線で目立つ)
@@ -6037,6 +6851,16 @@ class NetSysApp:
     def _on_nic_select(self, event=None):
         """NIC プルダウンで選択時"""
         self._selected_nic = self.nic_var.get()
+        # 選択後、 Combobox の親にフォーカスを移すことでテキストハイライトを解除する。
+        # selection_clear() は環境によっては textvariable の表示まで消してしまう
+        # ことがあるので使わない (IF 欄が空白になる問題があった)。
+        try:
+            if event and event.widget:
+                event.widget.master.focus_set()
+            else:
+                self.root.focus_set()
+        except Exception:
+            pass
 
     def _toggle_disk_mode(self):
         """ディスクの表示モードを循環: ALL → vol[0] → vol[1] → ... → ALL"""
@@ -6366,7 +7190,23 @@ class NetSysApp:
                 b = int(0x3d * (1 - t) + 0x5a * t)
             return f'#{r:02x}{g:02x}{b:02x}'
 
-        bar_colors = [_core_color(v) for v in d['cpu_per']]
+        def _virtual_color(v):
+            """仮想スレッド (HT) 用の紫グラデーション。
+            物理コアの暖色 (緑→黄→赤) と対比させ、 使用率で明度を変える。
+            低使用率 = 暗い紫 (#5a4adf) → 高使用率 = 明るい紫 (#c8a3ff)。"""
+            t = min(max(v / 100.0, 0.0), 1.0)
+            r = int(0x5a * (1 - t) + 0xc8 * t)
+            g = int(0x4a * (1 - t) + 0xa3 * t)
+            b = int(0xdf * (1 - t) + 0xff * t)
+            return f'#{r:02x}{g:02x}{b:02x}'
+
+        # 物理コア (前半) は使用率グラデーション (緑→黄→赤)、
+        # 仮想スレッド (split 以降) は紫グラデーション (使用率で明度変化) で区別
+        _split = self.static_data.get('cpu_cores_phys') or 0
+        bar_colors = [
+            (_virtual_color(v) if (_split and i >= _split) else _core_color(v))
+            for i, v in enumerate(d['cpu_per'])
+        ]
 
         self.chart_cpu.set_series(
             [(d['cpu_history'], ACCENT, '#0a2a3a')],
@@ -6376,7 +7216,8 @@ class NetSysApp:
             fill_stipple='gray25',
             bar_meta=bar_meta if bar_meta else None,
             bg_bar_colors=bar_colors,
-            side_pane_compact=True)
+            side_pane_compact=True,
+            bg_bar_split=self.static_data.get('cpu_cores_phys'))
 
         # ── NET TRAFFIC: bytes (実線) + pps (破線, 別スケール) を統合 ──
         # procs/conns も extras からここで合流させる (旧 PROCS/CONNS ミニカードを統合)
@@ -6594,48 +7435,36 @@ class NetSysApp:
             (f"{rate_fmt(d.get('disk_write_rate', 0)).strip()}", GREEN, 10),
         ]
         if hasattr(self, 'chart_dio'):
-            # read と write は値のレンジが大きく異なる (例: write GB/s,
-            # read KB/s) ことがよくあるので、別々の Y 軸スケールで描画する。
-            # クリックで破線対象を read/write の間でトグル可能。
+            # DISK I/O は read/write が KB〜GB の桁差で変動するため、
+            # 対数スケール + read/write 共通の固定上限で描画する。
+            # これにより「桁が違えば段が上がる」形で絶対量が直感的に分かり、
+            # かつ KB レベルのアイドル値も底に潰れずに見える。
+            # (動的線形スケールだと最大値が常に同じ高さに来て桁差が見えなかった)
             read_hist = d.get('disk_read_history', []) or []
             write_hist = d.get('disk_write_history', []) or []
-
-            def _auto_scale(values):
-                """履歴の最大値から階段スケール (5MB → 5GB) を選ぶ"""
-                mx = max(values) if values else 0
-                target = max(mx * 1.2, 5 * 1024 * 1024)
-                scale_steps = [
-                    5 * 1024 * 1024, 10 * 1024 * 1024, 20 * 1024 * 1024,
-                    50 * 1024 * 1024, 100 * 1024 * 1024, 200 * 1024 * 1024,
-                    500 * 1024 * 1024, 1000 * 1024 * 1024,
-                    2000 * 1024 * 1024, 5000 * 1024 * 1024,
-                ]
-                for s in scale_steps:
-                    if s >= target:
-                        return s
-                return scale_steps[-1]
-
-            write_max = _auto_scale(write_hist)
-            read_max  = _auto_scale(read_hist)
+            # 共通固定上限: 64 MB/s。 log_floor (16KB) との組で約3.6桁のレンジとなり、
+            # 1桁 (10倍) ごとに約28ptの段差がつく。 通常使用 (KB〜数MB) がきれいに展開され、
+            # 大きな read (数十MB) も収まる。 64MB 超は天井張り付き (稀)。
+            DISK_IO_LOG_MAX = 64 * 1024 * 1024
 
             # ダッシュモード: 0 = read 破線 / write 実線
             #                 1 = write 破線 / read 実線
             mode = getattr(self, '_disk_io_dash_mode', 0)
             if mode == 0:
-                # write がメイン (実線、太め)、read が extra (破線)
+                # write がメイン (実線、太め)、read が extra (破線)、 同一 log 軸
                 self.chart_dio.set_series(
                     [(write_hist, GREEN, None)],
-                    max_pct=write_max,
-                    log_scale=False,
-                    extra_series=[(read_hist, ACCENT, read_max)],
+                    max_pct=DISK_IO_LOG_MAX,
+                    log_scale=True,
+                    extra_series=[(read_hist, ACCENT, DISK_IO_LOG_MAX)],
                 )
             else:
-                # read がメイン (実線、太め)、write が extra (破線)
+                # read がメイン (実線、太め)、write が extra (破線)、 同一 log 軸
                 self.chart_dio.set_series(
                     [(read_hist, ACCENT, '#0a2a3a')],
-                    max_pct=read_max,
-                    log_scale=False,
-                    extra_series=[(write_hist, GREEN, write_max)],
+                    max_pct=DISK_IO_LOG_MAX,
+                    log_scale=True,
+                    extra_series=[(write_hist, GREEN, DISK_IO_LOG_MAX)],
                 )
 
         # ── SYSTEM タブ: メモリ ──
@@ -6699,6 +7528,11 @@ class NetSysApp:
                 self._update_gpu_combined(d)
             except Exception as ex:
                 print(f"[gpu live] {ex}")
+            # MEM カードの VRAM ドーナツも毎秒反映 (5秒待ちを解消)
+            try:
+                self._refresh_vram_display(d.get('gpu_extras'))
+            except Exception as ex:
+                print(f"[vram live] {ex}")
 
         # ── アラート評価 ──
         self._evaluate_alerts()
@@ -6735,34 +7569,59 @@ class NetSysApp:
 
         def task_heavy():
             """初回の heavy 取得を更に並列化してレスポンス向上。
-            元: disks + nics + processes + pdisks + extras を順次取得 (1-3秒)
-            新: 各取得を並列化し、終わった分から UI 反映 (体感が早くなる)"""
+            元: 全タスクが join() で終わるのを待ってから一括 UI 反映 (16-20秒待ち)
+            新: 各タスクが完了したら、その分だけ即 UI 反映 (体感は disks/nics は瞬時)
+            """
             results = {}
-            def _run(key, fn):
+            done_event = {}  # 完了通知用 (各タスク完了時に対応する関数を呼ぶ)
+            def _run(key, fn, on_done=None):
                 try:
-                    results[key] = fn()
+                    val = fn()
+                    results[key] = val
                 except Exception as e:
                     print(f"[bg heavy:{key}] {e}")
                     results[key] = None
-            # extras は内部で 5 つの PowerShell を並列実行するので、これが一番重い
-            # disks/nics/processes は psutil ベースで高速
-            # pdisks は details() からだが、別個に取得すれば並列化できる
+                # 完了したら即 UI 反映 (タスク単位)
+                if on_done is not None:
+                    try:
+                        self.root.after(0, lambda v=results[key]: on_done(v))
+                    except Exception as e:
+                        print(f"[bg heavy:{key} apply] {e}")
+                done_event[key] = True
+
+            # 個別 UI 反映関数 (各タスクが完了次第呼ぶ)
+            def apply_disks(d):
+                self._last_disks = d or []
+                if self._disk_cycle >= len(self._last_disks):
+                    self._disk_cycle = -1
+                try: self._render_disk_donut()
+                except Exception as e: print(f"[apply_disks] {e}")
+
+            def apply_nics(n):
+                # 簡易対応: 後で _apply_heavy が呼ばれた時にまとめて処理されるので、
+                # ここでは last_nics_map だけ更新
+                self._last_nics_map = {x['name']: x for x in (n or []) if x.get('up')}
+
+            # disks/nics/procs は psutil ベースなので即完了 → 即反映
+            # extras は LHM/smartctl ベースで時間がかかる
+            # pdisks は task_details が取得するのでここでは取らない (details 重複回避)
             threads = [
-                threading.Thread(target=_run, args=('disks', self.collector.disks), daemon=True),
-                threading.Thread(target=_run, args=('nics', self.collector.nics), daemon=True),
+                threading.Thread(target=_run, args=('disks', self.collector.disks, apply_disks), daemon=True),
+                threading.Thread(target=_run, args=('nics',  self.collector.nics, apply_nics), daemon=True),
                 threading.Thread(target=_run, args=('procs', self.collector.processes), daemon=True),
-                threading.Thread(target=_run, args=('pdisks', lambda: self.collector.details().get('pdisks', [])), daemon=True),
                 threading.Thread(target=_run, args=('extras', self.collector.extras), daemon=True),
             ]
             for t in threads: t.start()
             for t in threads: t.join()
+            # 全部揃ったら最終的にまとめて反映 (nics/procs/extras の UI 統合)
+            # pdisks は [] を渡す (実際の更新は task_details → _apply_details が担当)
             try:
                 self.root.after(0,
                     lambda: self._apply_heavy(
                         results.get('disks') or [],
                         results.get('nics') or [],
                         results.get('procs') or [],
-                        results.get('pdisks') or [],
+                        [],
                         results.get('extras')))
             except Exception as e:
                 print(f"[bg heavy initial] {e}")
@@ -6793,12 +7652,95 @@ class NetSysApp:
             threading.Thread(target=_periodic, daemon=True,
                              name='HistoryPurge').start()
 
-        # 並列実行（メインスレッドをブロックしない）
-        tasks = [task_lhm, task_details, task_security, task_heavy]
+        def task_cpu_name():
+            """正式な CPU 名 (PowerShell 経由) を取得して UI 更新。
+            起動時の static() は platform.processor() で速い値を返し、
+            これがバックグラウンドで詳細名を取得して上書きする。"""
+            try:
+                full_name = self.collector.resolve_cpu_name_full()
+                if full_name and full_name != self.static_data.get('cpu_name'):
+                    self.static_data['cpu_name'] = full_name
+                    def _update():
+                        try:
+                            if hasattr(self, 'lbl_cpu_name'):
+                                self.lbl_cpu_name.config(text=full_name)
+                        except Exception:
+                            pass
+                    self.root.after(0, _update)
+            except Exception as e:
+                print(f"[bg cpu_name] {e}")
+
+        # ── 起動時に並列実行 ──
+        # pywin32 化で各タスクは PowerShell の 10 倍以上速くなったため、
+        # 並列実行しても CPU を圧迫せず、起動完了が大幅に高速化される。
+        # details / security は DASHBOARD でも使うデータ (DIMM ドーナツ等) を含むので、
+        # 以前の lazy load (タブ切替時に取得) は廃止し、起動時に普通に取得する。
+        _ts = getattr(self, '_NetSysApp__ts', None)
+        if _ts: _ts("bg_init: start (parallel mode)")
+
+        tasks = [
+            task_lhm,
+            task_cpu_name,
+            task_heavy,      # extras, disks, nics, procs, pdisks
+            task_details,    # CPU/DIMM/Disk/GPU 詳細 (DASHBOARD で DIMM 使用、 起動時必須)
+            # task_security は lazy load に変更 (起動高速化、 約 1.5 秒短縮)
+            # security は PROCS & SECURITY タブでしか使われない → タブ初回切替時に取得
+        ]
         if getattr(self, 'history_db', None):
             tasks.append(task_history_purge)
+
         for fn in tasks:
             threading.Thread(target=fn, daemon=True).start()
+        if _ts: _ts("bg_init: all tasks launched")
+
+        # details は起動時に取得済みなので lazy 不要
+        self._lazy_details_loaded = True
+        # security は lazy load: PROCS & SECURITY タブを開いた時に取得開始
+        self._lazy_security_loaded = False
+
+        # 起動時の進捗対象タスク: lhm / heavy / details の 3 つ (security 除外)
+        self._init_total = 3
+
+    def _on_tab_changed_lazy(self, event):
+        """タブ切替イベント。SYSTEM / PROCS&SECURITY を初めて開いたときに
+        対応する重い取得を裏で起動する。"""
+        try:
+            current = self.notebook.select()
+            if not current:
+                return
+            current_widget = self.root.nametowidget(current)
+        except Exception:
+            return
+
+        # SYSTEM タブを初めて開いた → details を取得
+        if (current_widget == self.tab_system
+                and not self._lazy_details_loaded):
+            self._lazy_details_loaded = True
+            _ts = getattr(self, '_NetSysApp__ts', None)
+            if _ts: _ts("lazy: SYSTEM tab opened, fetching details")
+            def _lazy_details():
+                try:
+                    details = self.collector.details()
+                    self.root.after(0, lambda: self._apply_details(details))
+                    if _ts: self.root.after(0, lambda: _ts("lazy: details done"))
+                except Exception as e:
+                    print(f"[lazy details] {e}")
+            threading.Thread(target=_lazy_details, daemon=True).start()
+
+        # PROCS & SECURITY タブを初めて開いた → security を取得
+        if (current_widget == self.tab_ps
+                and not self._lazy_security_loaded):
+            self._lazy_security_loaded = True
+            _ts = getattr(self, '_NetSysApp__ts', None)
+            if _ts: _ts("lazy: PROCS&SECURITY tab opened, fetching security")
+            def _lazy_security():
+                try:
+                    sec = self.collector.security()
+                    self.root.after(0, lambda: self._apply_security(sec))
+                    if _ts: self.root.after(0, lambda: _ts("lazy: security done"))
+                except Exception as e:
+                    print(f"[lazy security] {e}")
+            threading.Thread(target=_lazy_security, daemon=True).start()
 
     def _draw_init_progress(self):
         """起動進捗バーを描画（ttk.Progressbar 使用）"""
@@ -6833,6 +7775,9 @@ class NetSysApp:
     def _init_step(self, label_done):
         """1タスク完了時。完了したタスクの名前をラベルに反映し、進捗+1"""
         self._init_done += 1
+        # 起動タイミング測定 (NETSYS_TIMING=1 のとき stdout 出力)
+        _ts = getattr(self, '_NetSysApp__ts', None)
+        if _ts: _ts(f"task done: {label_done} ({self._init_done}/{self._init_total})")
         if self._init_done >= self._init_total:
             self._init_current_label = 'READY'
             self._init_status_text = 'all sensors loaded'
@@ -6840,6 +7785,7 @@ class NetSysApp:
             elapsed = time.time() - self._init_started_at
             remaining_ms = max(800, int((2.5 - elapsed) * 1000))
             self.root.after(remaining_ms, self._hide_init_progress)
+            if _ts: _ts("ALL TASKS COMPLETE")
         else:
             self._init_current_label = 'LOADING'
             self._init_status_text = f'{label_done} ({self._init_done}/{self._init_total})'
@@ -6882,7 +7828,6 @@ class NetSysApp:
             threading.Thread(target=_run, args=('disks', self.collector.disks), daemon=True),
             threading.Thread(target=_run, args=('nics', self.collector.nics), daemon=True),
             threading.Thread(target=_run, args=('procs', self.collector.processes), daemon=True),
-            threading.Thread(target=_run, args=('pdisks', lambda: self.collector.details().get('pdisks', [])), daemon=True),
             threading.Thread(target=_run, args=('extras', self.collector.extras), daemon=True),
         ]
         for t in threads: t.start()
@@ -6893,10 +7838,23 @@ class NetSysApp:
                     results.get('disks') or [],
                     results.get('nics') or [],
                     results.get('procs') or [],
-                    results.get('pdisks') or [],
+                    [],
                     results.get('extras')))
         except Exception as e:
             print(f"[bg heavy] {e}")
+
+        # pdisks (物理ディスク詳細: SSD wear/temp/written) は slow-changing なので
+        # 毎回 (5秒毎) は取らず、 30秒毎 (6 tick に 1 回) に details(force) で更新する。
+        # details() のキャッシュ (20秒) も eff 効くが、 確実に再取得するため force。
+        self._heavy_tick_count = getattr(self, '_heavy_tick_count', 0) + 1
+        if self._heavy_tick_count % 6 == 0:
+            def _refresh_details():
+                try:
+                    details = self.collector.details(force=True)
+                    self.root.after(0, lambda: self._apply_details(details))
+                except Exception as e:
+                    print(f"[tick details] {e}")
+            threading.Thread(target=_refresh_details, daemon=True).start()
 
         # 次回をスケジュール
         threading.Timer(HEAVY_INTERVAL_S, self._tick_heavy).start()
@@ -6939,10 +7897,49 @@ class NetSysApp:
         current_values = list(self.nic_combo['values'])
         if current_values != names:
             self.nic_combo['values'] = names
-            # 未選択 or 選択値が無くなったらデフォルト選択 (ALL)
-            if not self._selected_nic or self._selected_nic not in names:
+            # ★ values を再設定すると ttk.Combobox の表示テキストがクリアされる。
+            #   per_proto (IPv4/IPv6) が起動後に増えて names が変わるたびに発生するため、
+            #   現在の選択 (_selected_nic) を current() で必ず復元する。
+            #   current(index) は ttk の正式な選択 API で、 nic_var.set だけでは
+            #   更新されない内部状態 (選択インデックス) も確実に更新する。
+            def _select(value):
+                # readonly Combobox では current(index) と textvariable.set の
+                # どちらか一方だけだと表示が出ないことがあるため両方実行する
+                try:
+                    self.nic_combo.current(names.index(value))
+                except (ValueError, Exception):
+                    pass
+                try:
+                    self.nic_var.set(value)
+                except Exception:
+                    pass
+
+            if self._selected_nic and self._selected_nic in names:
+                # 既存の選択を復元 (表示クリア対策)
+                _select(self._selected_nic)
+            else:
+                # 選択値が無くなった → ALL にフォールバック
                 self._selected_nic = 'ALL'
-                self.nic_var.set('ALL')
+                _select('ALL')
+
+            # 初回のみ: ノート PC (バッテリー搭載) なら WiFi NIC をデフォルトに
+            # 以降 (ユーザーが他を選んだ後) は再適用しない (_nic_default_applied フラグ)
+            if not self._nic_default_applied:
+                self._nic_default_applied = True
+                try:
+                    has_battery = psutil.sensors_battery() is not None
+                except Exception:
+                    has_battery = False
+                if has_battery:
+                    # 名前に Wi-Fi / WiFi / Wireless / WLAN を含むものを WiFi NIC とみなす
+                    wifi_nic = next(
+                        (n for n in names
+                         if any(kw in n.lower()
+                                for kw in ('wi-fi', 'wifi', 'wireless', 'wlan'))),
+                        None)
+                    if wifi_nic:
+                        self._selected_nic = wifi_nic
+                        _select(wifi_nic)
 
         # ── DASHBOARD: TOP プロセス ──
         top_procs = procs[:8]
@@ -6960,18 +7957,9 @@ class NetSysApp:
             self._apply_extras(extras)
 
         # ── SYSTEM タブ: 物理ディスクカード ──
-        if len(self._pdisk_widgets) != len(pdisks):
-            for w in self._pdisk_widgets: w.destroy()
-            self._pdisk_widgets = []
-            if pdisks:
-                for p in pdisks:
-                    self._pdisk_widgets.append(self._make_pdisk_card(self.pdisks_container, p))
-            else:
-                l = tk.Label(self.pdisks_container,
-                              text='// no physical disk data available',
-                              bg=PANEL, fg=DIM, font=FONT_MONO_XS)
-                l.pack(pady=20)
-                self._pdisk_widgets.append(l)
+        # pdisks は task_details (details()) 経由で _apply_details → _apply_pdisks
+        # で更新する。 task_heavy では取得しない (details() の重複呼び出しを避け、
+        # 起動時の lock 待ちをなくすため)。
 
         # ── PROCS & SECURITY タブ: フルプロセスリスト ──
         for c in self.proc_tree.get_children():
@@ -6984,6 +7972,24 @@ class NetSysApp:
                 p['pid'], p['name'], p['user'],
                 f"{p['cpu']:.1f}", bytes_fmt(p['memory']).strip(),
             ))
+
+    def _apply_pdisks(self, pdisks):
+        """SYSTEM タブの物理ディスクカードを更新。
+        task_details (details()) の結果から _apply_details 経由で呼ばれる。
+        以前は _apply_heavy が担当していたが、 task_heavy が details() を
+        重複呼び出ししていた起動ボトルネックを解消するため分離した。"""
+        if len(self._pdisk_widgets) != len(pdisks):
+            for w in self._pdisk_widgets: w.destroy()
+            self._pdisk_widgets = []
+            if pdisks:
+                for p in pdisks:
+                    self._pdisk_widgets.append(self._make_pdisk_card(self.pdisks_container, p))
+            else:
+                l = tk.Label(self.pdisks_container,
+                              text='// no physical disk data available',
+                              bg=PANEL, fg=DIM, font=FONT_MONO_XS)
+                l.pack(pady=20)
+                self._pdisk_widgets.append(l)
 
     def _gray_out_chart(self, chart, label='---', reason=''):
         """チャートをグレーアウトして「物理的に取得不可」を明示"""
@@ -7013,6 +8019,52 @@ class NetSysApp:
                     (reason, DIM, 7),
                 ],
                 side_width=70)
+
+    def _refresh_vram_display(self, gpu_extras):
+        """MEM カード内の GPU VRAM ドーナツ + 詳細ラベルを更新。
+        _apply_extras (5秒毎、 extras() 由来) と _apply_live (毎秒、 live() 由来)
+        の両方から呼ばれる。 gpu_extras の中身に応じて 5 通りに分岐。
+        """
+        if not hasattr(self, 'donut_vram'):
+            return
+        if gpu_extras:
+            vu = gpu_extras.get('vram_used_mb')
+            vt = gpu_extras.get('vram_total_mb')
+            is_igpu = gpu_extras.get('is_integrated')
+            if vu is not None and vt and vt > 0:
+                # 通常表示
+                pct = (vu / vt) * 100
+                self.donut_vram.set_value(
+                    pct, color=color_for_pct(pct),
+                    label=f"{pct:.0f}%",
+                    sublabel=f"{vu/1024:.1f}G")
+                self.lbl_vram_detail.config(
+                    text=f"{vu/1024:.1f} / {vt/1024:.1f} GB", fg=MUTED)
+            elif vu is not None and not vt:
+                # 使用量だけ取れて total が無い (D3D 統計のみ等)
+                self.donut_vram.set_value(
+                    0, color=ACCENT,
+                    label=f"{vu/1024:.1f}G",
+                    sublabel='used')
+                self.lbl_vram_detail.config(
+                    text=f"{vu/1024:.1f} GB used  (total ?)", fg=MUTED)
+            elif is_igpu:
+                # iGPU は VRAM がメインメモリ共有のため LHM が公開しないのが正常
+                self.donut_vram.set_value(
+                    0, color=DIM, label='iGPU', sublabel='shared')
+                self.lbl_vram_detail.config(
+                    text='// shared with RAM', fg=DIM)
+            else:
+                # 専用 GPU だが VRAM センサーが LHM で見えない
+                self.donut_vram.set_value(
+                    0, color=DIM, label='N/A', sublabel='')
+                self.lbl_vram_detail.config(
+                    text='// VRAM sensor unavailable', fg=DIM)
+        else:
+            # gpu_extras 自体が無い → LHM 未動作 + NVIDIA でもない
+            self.donut_vram.set_value(0, color=DIM, label='N/A', sublabel='')
+            self.lbl_vram_detail.config(
+                text='// LHM required', fg=YELLOW)
 
     def _apply_extras(self, e):
         """CPU温度・GPU使用率・プロセス数・接続数 + GPU詳細・SSD・CPU電圧を反映"""
@@ -7056,23 +8108,8 @@ class NetSysApp:
                     side_width=70)
 
         # ── GPU VRAM (MEM カード内のミニドーナツ。GPU 詳細自体は _update_gpu_combined が処理) ──
-        gpu_extras = e.get('gpu_extras')
-        if gpu_extras:
-            vu = gpu_extras.get('vram_used_mb')
-            vt = gpu_extras.get('vram_total_mb')
-            if vu is not None and vt and vt > 0:
-                pct = (vu / vt) * 100
-                self.donut_vram.set_value(
-                    pct, color=color_for_pct(pct),
-                    label=f"{pct:.0f}%",
-                    sublabel=f"{vu/1024:.1f}G")
-                self.lbl_vram_detail.config(
-                    text=f"{vu/1024:.1f} / {vt/1024:.1f} GB", fg=MUTED)
-        else:
-            # GPU 詳細自体が取れない → VRAM だけグレーアウト
-            self.donut_vram.set_value(0, color=DIM, label='N/A', sublabel='')
-            self.lbl_vram_detail.config(
-                text='// SETTINGSタブ参照', fg=YELLOW)
+        # 表示ロジックは _refresh_vram_display に切り出し、 _apply_live (毎秒) からも呼ぶ
+        self._refresh_vram_display(e.get('gpu_extras'))
 
         # ── SSD 詳細 ──
         ssd_extras = e.get('ssd_extras')
@@ -7109,12 +8146,17 @@ class NetSysApp:
             else:
                 written_str = ""
 
-            # 外周リング: TEMP の % (0-100°C スケール)
+            # 内側 (紫) リングの値:
+            # 元々は consumed (= 100 - wear) で SSD 寿命消費を表現していたが、
+            # 新品 (wear=100) では consumed=0 となり紫リングが見えなくなる問題があった。
+            # 「書き込み系の存在を示す」ためのインジケータとして、 視認可能な最低フロアを設定。
+            # 寿命消費が増えると紫リングも増えていく挙動はそのまま維持。
+            inner_pct = max(consumed, 6) if wear is not None else 0
             temp_pct = min(max(st or 0, 0), 100)
 
             if hasattr(self, 'donut_ssd_temp'):
                 self.donut_ssd_temp.set_value(
-                    consumed,
+                    inner_pct,
                     color=WRTN_RING,           # 内側 = 紫 (書き込み系)
                     label=temp_str,            # 中央メイン (温度)
                     sublabel=written_str,      # 中央下 (書き込み量)
@@ -7754,6 +8796,10 @@ class NetSysApp:
                 m.get('part_number', '---'),
                 m.get('serial', '---'),
             ))
+
+        # ── SYSTEM タブ: 物理ディスクカード (details の pdisks から) ──
+        # 以前は _apply_heavy が担当していたが、 起動高速化のため details 経由に統一
+        self._apply_pdisks(data.get('pdisks', []))
 
     def _make_gpu_card(self, parent, g):
         wrap = tk.Frame(parent, bg=PANEL,
